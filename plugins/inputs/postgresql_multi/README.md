@@ -71,7 +71,8 @@ to use them.
   # datname_include = []
   # datname_exclude = []
 
-  ## Interval for refreshing the list of databases.
+  ## Interval for refreshing the list of databases. The list is refreshed on
+  ## the first collection after each interval boundary on the wall clock.
   # datname_refresh_interval = "5m"
 
   ## Maximum number of queries to run concurrently. Each running query uses
@@ -144,7 +145,10 @@ name, so `app` only matches the database `app` while `app_.*` matches
 `datname_include` entries (or the list is empty) and none of the
 `datname_exclude` entries.
 
-The database list is refreshed every `datname_refresh_interval`. Connections
+The database list is refreshed on the first collection after each
+`datname_refresh_interval` boundary on the wall clock, so a new database
+shows up after at most `datname_refresh_interval` plus one collection
+interval. Connections
 to the databases are opened on first use and closed after each collection
 unless `keep_database_connections` is set.
 

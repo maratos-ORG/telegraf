@@ -360,6 +360,37 @@ func TestAccRow(t *testing.T) {
 	}
 }
 
+func TestRefreshDue(t *testing.T) {
+	interval := 2 * time.Minute
+	updated := time.Date(2026, 9, 20, 17, 46, 0, 50*int(time.Millisecond), time.UTC)
+
+	tests := []struct {
+		name     string
+		updated  time.Time
+		now      time.Time
+		expected bool
+	}{
+		{name: "never updated", now: updated, expected: true},
+		{name: "same tick", updated: updated, now: updated, expected: false},
+		{name: "one interval later", updated: updated, now: updated.Add(time.Minute), expected: false},
+		{
+			name:     "boundary reached slightly earlier than the update time",
+			updated:  updated,
+			now:      time.Date(2026, 9, 20, 17, 48, 0, 20*int(time.Millisecond), time.UTC),
+			expected: true,
+		},
+		{name: "boundary reached exactly", updated: updated, now: time.Date(2026, 9, 20, 17, 48, 0, 0, time.UTC), expected: true},
+		{name: "just before boundary", updated: updated, now: time.Date(2026, 9, 20, 17, 47, 59, 0, time.UTC), expected: false},
+		{name: "long overdue", updated: updated, now: updated.Add(time.Hour), expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, refreshDue(tt.updated, tt.now, interval))
+		})
+	}
+}
+
 func TestGatherClosesStaleServices(t *testing.T) {
 	p := newPlugin()
 	require.NoError(t, p.Init())

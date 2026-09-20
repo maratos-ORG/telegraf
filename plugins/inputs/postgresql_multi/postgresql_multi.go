@@ -277,10 +277,10 @@ func (p *Postgresql) Stop() {
 	}
 }
 
-// refreshDatnames updates the list of databases matching the filters if the
-// refresh interval has passed since the last update
+// refreshDatnames updates the list of databases matching the filters if a
+// refresh is due
 func (p *Postgresql) refreshDatnames(ctx context.Context) error {
-	if !p.datnamesUpdated.IsZero() && time.Since(p.datnamesUpdated) < time.Duration(p.DatnameRefreshInterval) {
+	if !refreshDue(p.datnamesUpdated, time.Now(), time.Duration(p.DatnameRefreshInterval)) {
 		return nil
 	}
 
@@ -521,6 +521,17 @@ func (p *Postgresql) accRow(
 	}
 	acc.AddFields(q.Measurement, fields, tags, timestamp)
 	return nil
+}
+
+// refreshDue reports whether the database list should be refreshed. The list
+// is refreshed on the first collection after a refresh interval boundary on
+// the wall clock, so with aligned collection intervals the refresh always
+// happens on the same collection regardless of small timing jitter.
+func refreshDue(updated, now time.Time, interval time.Duration) bool {
+	if updated.IsZero() {
+		return true
+	}
+	return !now.Before(updated.Truncate(interval).Add(interval))
 }
 
 func validateRole(role string) error {
