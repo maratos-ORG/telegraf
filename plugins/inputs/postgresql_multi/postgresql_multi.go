@@ -77,10 +77,6 @@ type query struct {
 	numericFloat   bool
 }
 
-type scanner interface {
-	Scan(dest ...interface{}) error
-}
-
 // job is a single unit of work: one query executed in one database
 type job struct {
 	datname string
@@ -462,71 +458,73 @@ func (p *Postgresql) gatherMetricsFromQuery(
 		}
 	}
 
+	// Prepare the row buffers once and reuse them for every row
+	values := make([]interface{}, len(columns))
+	pointers := make([]interface{}, len(columns))
+	for i := range values {
+		pointers[i] = &values[i]
+	}
+
+	// Logging every value is only done on demand: the arguments of a
+	// disabled Debugf call are still boxed and allocated for every column
+	// of every row
+	debug := p.Log.Level() >= telegraf.Debug
+
 	for rows.Next() {
-		if err := p.accRow(acc, rows, columns, numeric, j, timestamp); err != nil {
+		if err := rows.Scan(pointers...); err != nil {
 			return err
 		}
+		p.accRow(acc, columns, values, numeric, j, timestamp, debug)
 	}
 	return rows.Err()
 }
 
 func (p *Postgresql) accRow(
 	acc telegraf.Accumulator,
-	row scanner,
 	columns []string,
+	values []interface{},
 	numeric map[string]bool,
 	j job,
 	timestamp time.Time,
-) error {
+	debug bool,
+) {
 	q := j.query
 
-	// this is where we'll store the column name with its *interface{}
-	columnMap := make(map[string]*interface{})
-
-	for _, column := range columns {
-		columnMap[column] = new(interface{})
-	}
-
-	columnVars := make([]interface{}, 0, len(columnMap))
-	// populate the array of interface{} with the pointers in the right order
-	for i := 0; i < len(columnMap); i++ {
-		columnVars = append(columnVars, columnMap[columns[i]])
-	}
-
-	// deconstruct array of variables and send to Scan
-	if err := row.Scan(columnVars...); err != nil {
-		return err
-	}
-
-	// extract the database name from the column map if available
+	// extract the database name from the row if available
 	dbname := j.datname
-	if c, ok := columnMap["datname"]; ok && *c != nil {
-		if datname, ok := (*c).(string); ok {
+	for i, col := range columns {
+		if col != "datname" {
+			continue
+		}
+		if datname, ok := values[i].(string); ok {
 			dbname = datname
 		}
+		break
 	}
 
-	tags := map[string]string{
-		"server": p.service.SanitizedAddress,
-		"db":     dbname,
-	}
+	tags := make(map[string]string, len(q.additionalTags)+2)
+	tags["server"] = p.service.SanitizedAddress
+	tags["db"] = dbname
 
-	fields := make(map[string]interface{})
-	for col, val := range columnMap {
-		p.Log.Debugf("Column: %s = %T: %v\n", col, *val, *val)
-		if ignoredColumns[col] || *val == nil {
+	fields := make(map[string]interface{}, len(columns))
+	for i, col := range columns {
+		value := values[i]
+		if debug {
+			p.Log.Debugf("Column: %s = %T: %v\n", col, value, value)
+		}
+		if ignoredColumns[col] || value == nil {
 			continue
 		}
 
 		if col == q.Timestamp {
-			if v, ok := (*val).(time.Time); ok {
+			if v, ok := value.(time.Time); ok {
 				timestamp = v
 			}
 			continue
 		}
 
 		if q.additionalTags[col] {
-			v, err := internal.ToString(*val)
+			v, err := internal.ToString(value)
 			if err != nil {
 				p.Log.Debugf("Failed to add %q as additional tag: %v", col, err)
 			} else {
@@ -536,7 +534,7 @@ func (p *Postgresql) accRow(
 		}
 
 		if q.numericFloat && numeric[col] {
-			v, err := toFloat(*val)
+			v, err := toFloat(value)
 			if err != nil {
 				p.Log.Debugf("Failed to convert numeric column %q: %v", col, err)
 				continue
@@ -548,7 +546,7 @@ func (p *Postgresql) accRow(
 			continue
 		}
 
-		switch v := (*val).(type) {
+		switch v := value.(type) {
 		case []byte:
 			if q.stringTags {
 				tags[col] = string(v)
@@ -562,17 +560,12 @@ func (p *Postgresql) accRow(
 				fields[col] = v
 			}
 		default:
-			fields[col] = *val
+			fields[col] = value
 		}
 	}
 	acc.AddFields(q.Measurement, fields, tags, timestamp)
-	return nil
 }
 
-// refreshDue reports whether the database list should be refreshed. The list
-// is refreshed on the first collection after a refresh interval boundary on
-// the wall clock, so with aligned collection intervals the refresh always
-// happens on the same collection regardless of small timing jitter.
 func refreshDue(updated, now time.Time, interval time.Duration) bool {
 	if updated.IsZero() {
 		return true

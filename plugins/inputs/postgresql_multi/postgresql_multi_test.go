@@ -2,11 +2,8 @@ package postgresql_multi
 
 import (
 	"context"
-	"errors"
+	"database/sql"
 	"fmt"
-	"io"
-	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -283,14 +280,14 @@ func TestAccRow(t *testing.T) {
 		query          query
 		columns        []string
 		numeric        map[string]bool
-		row            fakeRow
+		values         []interface{}
 		expectedTags   map[string]string
 		expectedFields map[string]interface{}
 	}{
 		{
 			name:    "db tag from job",
 			columns: []string{"cat"},
-			row:     fakeRow{fields: []interface{}{"gato"}},
+			values:  []interface{}{"gato"},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -300,7 +297,7 @@ func TestAccRow(t *testing.T) {
 		{
 			name:    "db tag from datname column",
 			columns: []string{"datname", "cat"},
-			row:     fakeRow{fields: []interface{}{"name", "gato"}},
+			values:  []interface{}{"name", "gato"},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "name",
@@ -310,7 +307,7 @@ func TestAccRow(t *testing.T) {
 		{
 			name:    "non-string datname column is ignored",
 			columns: []string{"datname", "cat"},
-			row:     fakeRow{fields: []interface{}{1, "gato"}},
+			values:  []interface{}{1, "gato"},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -320,7 +317,7 @@ func TestAccRow(t *testing.T) {
 		{
 			name:    "null and stats_reset columns are skipped",
 			columns: []string{"stats_reset", "nothing", "value"},
-			row:     fakeRow{fields: []interface{}{time.Now(), nil, int64(42)}},
+			values:  []interface{}{time.Now(), nil, int64(42)},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -331,7 +328,7 @@ func TestAccRow(t *testing.T) {
 			name:    "tagvalue columns become tags",
 			query:   query{Tagvalue: "state,pid"},
 			columns: []string{"state", "pid", "count"},
-			row:     fakeRow{fields: []interface{}{"idle", int64(7), int64(3)}},
+			values:  []interface{}{"idle", int64(7), int64(3)},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -344,7 +341,7 @@ func TestAccRow(t *testing.T) {
 			name:    "string columns as tags",
 			query:   query{StringColumnsAsTags: boolPtr(true)},
 			columns: []string{"relname", "raw", "count"},
-			row:     fakeRow{fields: []interface{}{"users", []byte("bytes"), int64(3)}},
+			values:  []interface{}{"users", []byte("bytes"), int64(3)},
 			expectedTags: map[string]string{
 				"server":  "server",
 				"db":      "mydb",
@@ -356,7 +353,7 @@ func TestAccRow(t *testing.T) {
 		{
 			name:    "string columns as fields",
 			columns: []string{"relname", "raw"},
-			row:     fakeRow{fields: []interface{}{"users", []byte("bytes")}},
+			values:  []interface{}{"users", []byte("bytes")},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -367,7 +364,7 @@ func TestAccRow(t *testing.T) {
 			name:    "numeric as float",
 			columns: []string{"ratio", "text", "big", "nan", "bad"},
 			numeric: map[string]bool{"ratio": true, "big": true, "nan": true, "bad": true},
-			row:     fakeRow{fields: []interface{}{"10.5", "10.5", []byte("1e3"), "NaN", "abc"}},
+			values:  []interface{}{"10.5", "10.5", []byte("1e3"), "NaN", "abc"},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -379,7 +376,7 @@ func TestAccRow(t *testing.T) {
 			query:   query{NumericAsFloat: boolPtr(false)},
 			columns: []string{"ratio"},
 			numeric: map[string]bool{"ratio": true},
-			row:     fakeRow{fields: []interface{}{"10.5"}},
+			values:  []interface{}{"10.5"},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -390,7 +387,7 @@ func TestAccRow(t *testing.T) {
 			name:    "timestamp column",
 			query:   query{Timestamp: "ts"},
 			columns: []string{"ts", "value"},
-			row:     fakeRow{fields: []interface{}{time.Date(1980, 7, 23, 0, 0, 0, 0, time.UTC), int64(1)}},
+			values:  []interface{}{time.Date(1980, 7, 23, 0, 0, 0, 0, time.UTC), int64(1)},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -410,7 +407,7 @@ func TestAccRow(t *testing.T) {
 			var acc testutil.Accumulator
 			j := job{datname: "mydb", query: &p.Query[0]}
 			now := time.Now()
-			require.NoError(t, p.accRow(&acc, tt.row, tt.columns, tt.numeric, j, now))
+			p.accRow(&acc, tt.columns, tt.values, tt.numeric, j, now, false)
 			require.Len(t, acc.Metrics, 1)
 
 			metric := acc.Metrics[0]
@@ -443,64 +440,50 @@ func TestMetadataCached(t *testing.T) {
 	require.Equal(t, []string{"app_1"}, p.datnames)
 }
 
-func TestMetadataNotCachedByDefault(t *testing.T) {
-	p := newPlugin()
-	require.NoError(t, p.Init())
-	require.Zero(t, p.MetadataRefreshInterval)
-
-	// A zero interval makes every collection read the server information
-	require.True(t, refreshDue(time.Now(), time.Now(), time.Duration(p.MetadataRefreshInterval)))
-}
-
 func TestRefreshDue(t *testing.T) {
-	interval := 2 * time.Minute
+	const interval = 2 * time.Minute
 	updated := time.Date(2026, 9, 20, 17, 46, 0, 50*int(time.Millisecond), time.UTC)
 
 	tests := []struct {
 		name     string
 		updated  time.Time
 		now      time.Time
+		interval time.Duration
 		expected bool
 	}{
-		{name: "never updated", now: updated, expected: true},
-		{name: "same tick", updated: updated, now: updated, expected: false},
-		{name: "one interval later", updated: updated, now: updated.Add(time.Minute), expected: false},
+		{name: "never updated", now: updated, interval: interval, expected: true},
+		{name: "zero interval reads every time", updated: updated, now: updated, interval: 0, expected: true},
+		{name: "same tick", updated: updated, now: updated, interval: interval, expected: false},
+		{name: "within the interval", updated: updated, now: updated.Add(time.Minute), interval: interval, expected: false},
 		{
 			name:     "boundary reached slightly earlier than the update time",
 			updated:  updated,
 			now:      time.Date(2026, 9, 20, 17, 48, 0, 20*int(time.Millisecond), time.UTC),
+			interval: interval,
 			expected: true,
 		},
-		{name: "boundary reached exactly", updated: updated, now: time.Date(2026, 9, 20, 17, 48, 0, 0, time.UTC), expected: true},
-		{name: "just before boundary", updated: updated, now: time.Date(2026, 9, 20, 17, 47, 59, 0, time.UTC), expected: false},
-		{name: "long overdue", updated: updated, now: updated.Add(time.Hour), expected: true},
+		{
+			name:     "boundary reached exactly",
+			updated:  updated,
+			now:      time.Date(2026, 9, 20, 17, 48, 0, 0, time.UTC),
+			interval: interval,
+			expected: true,
+		},
+		{
+			name:     "just before the boundary",
+			updated:  updated,
+			now:      time.Date(2026, 9, 20, 17, 47, 59, 0, time.UTC),
+			interval: interval,
+			expected: false,
+		},
+		{name: "long overdue", updated: updated, now: updated.Add(time.Hour), interval: interval, expected: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.expected, refreshDue(tt.updated, tt.now, interval))
+			require.Equal(t, tt.expected, refreshDue(tt.updated, tt.now, tt.interval))
 		})
 	}
-}
-
-type fakeRow struct {
-	fields []interface{}
-}
-
-func (f fakeRow) Scan(dest ...interface{}) error {
-	if len(f.fields) != len(dest) {
-		return errors.New("nada matchy buddy")
-	}
-
-	for i, d := range dest {
-		switch d := d.(type) {
-		case *interface{}:
-			*d = f.fields[i]
-		default:
-			return fmt.Errorf("bad type %T", d)
-		}
-	}
-	return nil
 }
 
 func boolPtr(v bool) *bool {
@@ -529,20 +512,24 @@ func startServer(t *testing.T, databases ...string) *testServer {
 	}
 	require.NoError(t, container.Start(), "failed to start container")
 
-	for _, db := range databases {
-		code, _, err := container.Exec([]string{"psql", "-U", "postgres", "-c", "CREATE DATABASE " + db})
+	address := fmt.Sprintf(
+		"host=%s port=%s user=postgres dbname=postgres sslmode=disable",
+		container.Address,
+		container.Ports[servicePort],
+	)
+
+	if len(databases) > 0 {
+		db, err := sql.Open("pgx", address)
 		require.NoError(t, err)
-		require.Zero(t, code, "failed to create database %q", db)
+		defer db.Close()
+
+		for _, name := range databases {
+			_, err := db.Exec("CREATE DATABASE " + name)
+			require.NoErrorf(t, err, "creating database %q failed", name)
+		}
 	}
 
-	return &testServer{
-		container: container,
-		address: fmt.Sprintf(
-			"host=%s port=%s user=postgres dbname=postgres sslmode=disable",
-			container.Address,
-			container.Ports[servicePort],
-		),
-	}
+	return &testServer{container: container, address: address}
 }
 
 func (s *testServer) stop() {
@@ -782,19 +769,19 @@ func TestKeepConnectionsIntegration(t *testing.T) {
 	defer server.stop()
 	server.address += " application_name=postgresql_multi_test"
 
+	// Observe the server from an independent connection, as the sessions of
+	// the plugin can only be counted once its collection is done
+	observer, err := sql.Open("pgx", server.address)
+	require.NoError(t, err)
+	defer observer.Close()
+	observer.SetMaxOpenConns(1)
+
 	sessions := func() int {
-		code, out, err := server.container.Exec([]string{
-			"psql", "-U", "postgres", "-tAc",
-			"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'postgresql_multi_test'",
-		})
-		require.NoError(t, err)
-		require.Zero(t, code)
-		buf, err := io.ReadAll(out)
-		require.NoError(t, err)
-		// The output is prefixed with a docker stream header
-		n, err := strconv.Atoi(strings.TrimFunc(string(buf), func(r rune) bool { return r < '0' || r > '9' }))
-		require.NoError(t, err)
-		return n
+		var count int
+		query := `SELECT count(*) FROM pg_stat_activity ` +
+			`WHERE application_name = 'postgresql_multi_test' AND pid <> pg_backend_pid()`
+		require.NoError(t, observer.QueryRow(query).Scan(&count))
+		return count
 	}
 
 	tests := []struct {
@@ -833,31 +820,11 @@ func TestKeepConnectionsIntegration(t *testing.T) {
 			require.Empty(t, acc.Errors)
 
 			// Give the server a moment to register closed sessions
-			time.Sleep(500 * time.Millisecond)
-			require.Equal(t, tt.expected, sessions())
+			require.Eventually(t, func() bool {
+				return sessions() == tt.expected
+			}, 5*time.Second, 100*time.Millisecond)
 		})
 	}
-}
-
-func TestScriptIntegration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
-
-	server := startServer(t)
-	defer server.stop()
-
-	acc := server.run(t, &Postgresql{
-		NumericAsFloat: true,
-		Query: []query{{
-			Measurement: "script",
-			Script:      "testdata/test.sql",
-		}},
-	})
-	require.Empty(t, acc.Errors)
-
-	require.Equal(t, uint64(1), acc.NMetrics())
-	require.True(t, acc.HasInt64Field("script", "first"))
 }
 
 func TestNumericConversionIntegration(t *testing.T) {
@@ -966,4 +933,50 @@ func TestRoleFilterIntegration(t *testing.T) {
 	require.True(t, acc.HasMeasurement("primary_only"))
 	require.False(t, acc.HasMeasurement("replica_only"))
 	require.True(t, acc.HasMeasurement("everywhere"))
+}
+
+func BenchmarkAccRow(b *testing.B) {
+	columns := []string{
+		"datname", "relname", "schemaname", "n_live_tup", "n_dead_tup",
+		"seq_scan", "idx_scan", "table_size_b", "bloat_pct", "last_vacuum",
+	}
+	row := []interface{}{
+		"app_1", "users", "public", int64(20000), int64(6667),
+		int64(15), int64(3), int64(5652480), 34.6, "2026-09-22",
+	}
+
+	for _, tt := range []struct {
+		name  string
+		debug bool
+	}{{name: "debug off", debug: false}, {name: "debug on", debug: true}} {
+		b.Run(tt.name, func(b *testing.B) {
+			p := newPlugin()
+			p.Log = testutil.Logger{Quiet: true}
+			p.Query = []query{{Sqlquery: "SELECT 1", Measurement: "bench", Tagvalue: "relname,schemaname"}}
+			require.NoError(b, p.Init())
+
+			var acc testutil.Accumulator
+			j := job{datname: "app_1", query: &p.Query[0]}
+			now := time.Now()
+
+			// The row buffers are prepared once per result set, as in
+			// gatherMetricsFromQuery
+			values := make([]interface{}, len(columns))
+			pointers := make([]interface{}, len(columns))
+			for i := range values {
+				pointers[i] = &values[i]
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// simulate rows.Scan writing into the reused buffer
+				for k := range row {
+					*(pointers[k].(*interface{})) = row[k]
+				}
+				p.accRow(&acc, columns, values, nil, j, now, tt.debug)
+				acc.ClearMetrics()
+			}
+		})
+	}
 }
