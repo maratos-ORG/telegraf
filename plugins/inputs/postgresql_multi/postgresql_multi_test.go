@@ -1,6 +1,7 @@
 package postgresql_multi
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -39,7 +40,7 @@ func TestInitDefaults(t *testing.T) {
 	require.NoError(t, p.Init())
 
 	require.Equal(t, config.Duration(60*time.Second), p.Timeout)
-	require.Equal(t, config.Duration(5*time.Minute), p.DatnameRefreshInterval)
+	require.Equal(t, config.Duration(5*time.Minute), p.MetadataRefreshInterval)
 	require.Equal(t, 1, p.MaxConnections)
 	require.Equal(t, "any", p.Role)
 
@@ -361,6 +362,22 @@ func TestAccRow(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMetadataCached(t *testing.T) {
+	p := newPlugin()
+	require.NoError(t, p.Init())
+
+	// The pool is not started, so any query would panic on a nil database
+	p.dbVersion = 1700
+	p.inRecovery = true
+	p.datnames = []string{"app_1"}
+	p.metadataUpdated = time.Now()
+
+	require.NoError(t, p.refreshMetadata(context.Background()))
+	require.Equal(t, 1700, p.dbVersion)
+	require.True(t, p.inRecovery)
+	require.Equal(t, []string{"app_1"}, p.datnames)
 }
 
 func TestRefreshDue(t *testing.T) {
@@ -818,6 +835,42 @@ func TestQueryTimeoutIntegration(t *testing.T) {
 	require.ErrorContains(t, acc.Errors[0], `query "slow"`)
 	require.False(t, acc.HasMeasurement("slow"))
 	require.True(t, acc.HasInt64Field("fast", "value"))
+}
+
+func TestCachedRoleIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	server := startServer(t)
+	defer server.stop()
+
+	p := &Postgresql{
+		Log:                     testutil.Logger{},
+		Config:                  postgresql.Config{Address: config.NewSecret([]byte(server.address)), MaxIdle: 1, MaxOpen: 1},
+		NumericAsFloat:          true,
+		MetadataRefreshInterval: config.Duration(time.Hour),
+		Query:                   []query{{Measurement: "primary_only", Sqlquery: "SELECT 1 AS value", Role: "primary"}},
+	}
+	require.NoError(t, p.Init())
+
+	var acc testutil.Accumulator
+	require.NoError(t, p.Start(&acc))
+	defer p.Stop()
+
+	// The container is a primary, so the query runs
+	require.NoError(t, p.Gather(&acc))
+	require.Empty(t, acc.Errors)
+	require.True(t, acc.HasMeasurement("primary_only"))
+
+	// Pretend the server became a replica without the cache knowing about
+	// it: the next collection must use the cached role instead of asking
+	// the server again
+	acc.ClearMetrics()
+	p.inRecovery = true
+	require.NoError(t, p.Gather(&acc))
+	require.Empty(t, acc.Errors)
+	require.False(t, acc.HasMeasurement("primary_only"))
 }
 
 func TestRoleFilterIntegration(t *testing.T) {

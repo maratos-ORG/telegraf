@@ -71,9 +71,11 @@ to use them.
   # datname_include = []
   # datname_exclude = []
 
-  ## Interval for refreshing the list of databases. The list is refreshed on
-  ## the first collection after each interval boundary on the wall clock.
-  # datname_refresh_interval = "5m"
+  ## Interval for refreshing the server version, the server role and the
+  ## list of databases. They are cached and refreshed on the first collection
+  ## after each interval boundary on the wall clock, so a collection between
+  ## two refreshes does not query the connection database at all.
+  # metadata_refresh_interval = "5m"
 
   ## Maximum number of connections used concurrently. With a single database
   ## to query this many queries run concurrently in it. With several
@@ -150,18 +152,25 @@ name, so `app` only matches the database `app` while `app_.*` matches
 `datname_exclude` entries.
 
 The database list is refreshed on the first collection after each
-`datname_refresh_interval` boundary on the wall clock, so a new database
-shows up after at most `datname_refresh_interval` plus one collection
-interval. Connections
-to the databases are opened on first use and closed after each collection
-unless `keep_database_connections` is set.
+`metadata_refresh_interval` boundary on the wall clock, so a new database
+shows up after at most `metadata_refresh_interval` plus one collection
+interval.
 
 ## Server role
 
-The server role is determined on every collection using
-`pg_is_in_recovery()`. Queries with `role = "primary"` are only run if the
-server is not in recovery, queries with `role = "replica"` only if it is.
-The plugin-level `role` option sets the default for all queries.
+The server role is determined using `pg_is_in_recovery()`. Queries with
+`role = "primary"` are only run if the server is not in recovery, queries
+with `role = "replica"` only if it is. The plugin-level `role` option sets
+the default for all queries.
+
+## Cached server information
+
+The server version, the server role and the list of databases are read
+together and cached for `metadata_refresh_interval`. A collection between
+two refreshes uses the cached values and does not query the connection
+database at all. After a role change the plugin therefore keeps using the
+previous role for up to one refresh interval, so choose the interval short
+enough for how fast a promoted server should be picked up.
 
 ## Timeouts and concurrency
 

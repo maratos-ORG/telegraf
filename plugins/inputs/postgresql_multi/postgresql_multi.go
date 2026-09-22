@@ -34,7 +34,7 @@ type Postgresql struct {
 	Role                    string          `toml:"role"`
 	DatnameInclude          []string        `toml:"datname_include"`
 	DatnameExclude          []string        `toml:"datname_exclude"`
-	DatnameRefreshInterval  config.Duration `toml:"datname_refresh_interval"`
+	MetadataRefreshInterval config.Duration `toml:"metadata_refresh_interval"`
 	MaxConnections          int             `toml:"max_connections"`
 	KeepDatabaseConnections bool            `toml:"keep_database_connections"`
 	StringColumnsAsTags     bool            `toml:"string_columns_as_tags"`
@@ -48,8 +48,10 @@ type Postgresql struct {
 	includeRegex []*regexp.Regexp
 	excludeRegex []*regexp.Regexp
 
+	dbVersion       int
+	inRecovery      bool
 	datnames        []string
-	datnamesUpdated time.Time
+	metadataUpdated time.Time
 }
 
 type query struct {
@@ -90,8 +92,8 @@ func (p *Postgresql) Init() error {
 	if p.Timeout <= 0 {
 		p.Timeout = config.Duration(60 * time.Second)
 	}
-	if p.DatnameRefreshInterval <= 0 {
-		p.DatnameRefreshInterval = config.Duration(5 * time.Minute)
+	if p.MetadataRefreshInterval <= 0 {
+		p.MetadataRefreshInterval = config.Duration(5 * time.Minute)
 	}
 	if p.MaxConnections <= 0 {
 		p.MaxConnections = 1
@@ -196,23 +198,23 @@ func (p *Postgresql) Gather(acc telegraf.Accumulator) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.Timeout))
 	defer cancel()
 
-	// Retrieving the database version and the server role
-	var dbVersion int
-	var inRecovery bool
-	row := p.service.DB.QueryRowContext(ctx,
-		`SELECT setting::integer / 100, pg_is_in_recovery() FROM pg_settings WHERE name = 'server_version_num'`)
-	if err := row.Scan(&dbVersion, &inRecovery); err != nil {
-		return fmt.Errorf("querying server version and role failed: %w", err)
+	// Refresh the cached server version, role and database list if due
+	if err := p.refreshMetadata(ctx); err != nil {
+		acc.AddError(err)
+	}
+	if p.dbVersion == 0 {
+		// The server information was never read successfully
+		return nil
 	}
 
 	// Select the queries to run for this server version and role
 	queries := make([]*query, 0, len(p.Query))
 	for i := range p.Query {
 		q := &p.Query[i]
-		if !matchesVersion(q, dbVersion) {
+		if !matchesVersion(q, p.dbVersion) {
 			continue
 		}
-		if !matchesRole(q.Role, inRecovery) {
+		if !matchesRole(q.Role, p.inRecovery) {
 			p.Log.Debugf("Skipping query %q as the server role does not match %q", q.Measurement, q.Role)
 			continue
 		}
@@ -235,9 +237,6 @@ func (p *Postgresql) Gather(acc telegraf.Accumulator) error {
 	// Determine the databases to run the queries in
 	datnames := []string{p.service.ConnectionDatabase}
 	if len(p.includeRegex) > 0 || len(p.excludeRegex) > 0 {
-		if err := p.refreshDatnames(ctx); err != nil {
-			acc.AddError(err)
-		}
 		datnames = p.datnames
 	}
 	if len(datnames) == 0 {
@@ -346,13 +345,32 @@ func (p *Postgresql) Stop() {
 	p.service.Stop()
 }
 
-// refreshDatnames updates the list of databases matching the filters if a
-// refresh is due
-func (p *Postgresql) refreshDatnames(ctx context.Context) error {
-	if !refreshDue(p.datnamesUpdated, time.Now(), time.Duration(p.DatnameRefreshInterval)) {
+// refreshMetadata updates the cached server version, role and list of
+// databases if a refresh is due. Caching them keeps the collections between
+// two refreshes from connecting to the connection database at all.
+func (p *Postgresql) refreshMetadata(ctx context.Context) error {
+	if !refreshDue(p.metadataUpdated, time.Now(), time.Duration(p.MetadataRefreshInterval)) {
 		return nil
 	}
 
+	row := p.service.DB.QueryRowContext(ctx,
+		`SELECT setting::integer / 100, pg_is_in_recovery() FROM pg_settings WHERE name = 'server_version_num'`)
+	if err := row.Scan(&p.dbVersion, &p.inRecovery); err != nil {
+		return fmt.Errorf("querying server version and role failed: %w", err)
+	}
+
+	if len(p.includeRegex) > 0 || len(p.excludeRegex) > 0 {
+		if err := p.refreshDatnames(ctx); err != nil {
+			return err
+		}
+	}
+
+	p.metadataUpdated = time.Now()
+	return nil
+}
+
+// refreshDatnames updates the list of databases matching the filters
+func (p *Postgresql) refreshDatnames(ctx context.Context) error {
 	rows, err := p.service.DB.QueryContext(ctx,
 		`SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname`)
 	if err != nil {
@@ -378,7 +396,6 @@ func (p *Postgresql) refreshDatnames(ctx context.Context) error {
 		p.Log.Warn("No database matches the datname_include/datname_exclude filters")
 	}
 	p.datnames = datnames
-	p.datnamesUpdated = time.Now()
 
 	return nil
 }
