@@ -3,6 +3,9 @@ package postgresql_multi
 import (
 	"errors"
 	"fmt"
+	"io"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -391,18 +394,6 @@ func TestRefreshDue(t *testing.T) {
 	}
 }
 
-func TestGatherClosesStaleServices(t *testing.T) {
-	p := newPlugin()
-	require.NoError(t, p.Init())
-
-	p.dbServices["gone"] = &postgresql.Service{}
-	p.dbServices["kept"] = &postgresql.Service{}
-	p.closeStaleServices([]string{"kept"})
-
-	require.Contains(t, p.dbServices, "kept")
-	require.NotContains(t, p.dbServices, "gone")
-}
-
 type fakeRow struct {
 	fields []interface{}
 }
@@ -574,28 +565,190 @@ func TestMultipleDatabasesIntegration(t *testing.T) {
 	}
 }
 
+func TestConcurrentDatabasesIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	server := startServer(t, "app_1", "app_2", "app_3", "app_4")
+	defer server.stop()
+	server.address += " application_name=postgresql_multi_test"
+
+	// Each query counts the active sessions of this plugin before sleeping,
+	// so concurrently running queries see each other.
+	const countActive = `SELECT (SELECT count(*) FROM pg_stat_activity ` +
+		`WHERE application_name = 'postgresql_multi_test' AND state = 'active' AND datname <> 'postgres') AS active, ` +
+		`pg_backend_pid() AS pid, pg_sleep(0.2)`
+
+	tests := []struct {
+		name           string
+		maxConnections int
+		expected       int64
+	}{
+		{name: "sequential", maxConnections: 1, expected: 1},
+		{name: "two databases", maxConnections: 2, expected: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			acc := server.run(t, &Postgresql{
+				NumericAsFloat: true,
+				DatnameInclude: []string{"app_.*"},
+				MaxConnections: tt.maxConnections,
+				Query: []query{
+					{Measurement: "first", Sqlquery: countActive},
+					{Measurement: "second", Sqlquery: countActive},
+				},
+			})
+			require.Empty(t, acc.Errors)
+
+			expectedDBs := map[string]int{"app_1": 1, "app_2": 1, "app_3": 1, "app_4": 1}
+			require.Equal(t, expectedDBs, dbTags(acc.GetTelegrafMetrics(), "first"))
+			require.Equal(t, expectedDBs, dbTags(acc.GetTelegrafMetrics(), "second"))
+
+			// The maximum number of active sessions seen by any query must
+			// match the number of concurrently processed databases
+			var maxActive int64
+			pids := make(map[string]map[int64]bool)
+			for _, m := range acc.GetTelegrafMetrics() {
+				v, found := m.GetField("active")
+				require.True(t, found)
+				if active := v.(int64); active > maxActive {
+					maxActive = active
+				}
+
+				// Both queries of a database must have run on the same connection
+				db, _ := m.GetTag("db")
+				pid, _ := m.GetField("pid")
+				if pids[db] == nil {
+					pids[db] = make(map[int64]bool)
+				}
+				pids[db][pid.(int64)] = true
+			}
+			require.Equal(t, tt.expected, maxActive)
+			for db, set := range pids {
+				require.Lenf(t, set, 1, "database %s used more than one connection", db)
+			}
+		})
+	}
+}
+
 func TestConcurrentQueriesIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	server := startServer(t, "app_1")
+	defer server.stop()
+	server.address += " application_name=postgresql_multi_test"
+
+	// With a single database to query the queries run concurrently in it
+	const countActive = `SELECT (SELECT count(*) FROM pg_stat_activity ` +
+		`WHERE application_name = 'postgresql_multi_test' AND state = 'active') AS active, pg_sleep(0.2)`
+
+	tests := []struct {
+		name    string
+		include []string
+		db      string
+	}{
+		{name: "connection database", db: "postgres"},
+		{name: "single filtered database", include: []string{"app_1"}, db: "app_1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			acc := server.run(t, &Postgresql{
+				NumericAsFloat: true,
+				MaxConnections: 3,
+				DatnameInclude: tt.include,
+				Query: []query{
+					{Measurement: "q1", Sqlquery: countActive},
+					{Measurement: "q2", Sqlquery: countActive},
+					{Measurement: "q3", Sqlquery: countActive},
+					{Measurement: "q4", Sqlquery: countActive},
+				},
+			})
+			require.Empty(t, acc.Errors)
+
+			var maxActive int64
+			for _, m := range acc.GetTelegrafMetrics() {
+				db, _ := m.GetTag("db")
+				require.Equal(t, tt.db, db)
+				v, found := m.GetField("active")
+				require.True(t, found)
+				if active := v.(int64); active > maxActive {
+					maxActive = active
+				}
+			}
+			require.Equal(t, int64(3), maxActive)
+		})
+	}
+}
+
+func TestKeepConnectionsIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
 
 	server := startServer(t, "app_1", "app_2")
 	defer server.stop()
+	server.address += " application_name=postgresql_multi_test"
 
-	acc := server.run(t, &Postgresql{
-		NumericAsFloat: true,
-		DatnameInclude: []string{"app_.*"},
-		MaxConnections: 2,
-		Query: []query{
-			{Measurement: "first", Sqlquery: "SELECT pg_sleep(0.2), 1 AS value"},
-			{Measurement: "second", Sqlquery: "SELECT pg_sleep(0.2), 2 AS value"},
-		},
-	})
-	require.Empty(t, acc.Errors)
+	sessions := func() int {
+		code, out, err := server.container.Exec([]string{
+			"psql", "-U", "postgres", "-tAc",
+			"SELECT count(*) FROM pg_stat_activity WHERE application_name = 'postgresql_multi_test'",
+		})
+		require.NoError(t, err)
+		require.Zero(t, code)
+		buf, err := io.ReadAll(out)
+		require.NoError(t, err)
+		// The output is prefixed with a docker stream header
+		n, err := strconv.Atoi(strings.TrimFunc(string(buf), func(r rune) bool { return r < '0' || r > '9' }))
+		require.NoError(t, err)
+		return n
+	}
 
-	expected := map[string]int{"app_1": 1, "app_2": 1}
-	require.Equal(t, expected, dbTags(acc.GetTelegrafMetrics(), "first"))
-	require.Equal(t, expected, dbTags(acc.GetTelegrafMetrics(), "second"))
+	tests := []struct {
+		name     string
+		keep     bool
+		include  []string
+		expected int
+	}{
+		{name: "single database closed", keep: false, expected: 0},
+		{name: "single database kept", keep: true, expected: 3},
+		{name: "multiple databases closed", keep: false, include: []string{"app_.*"}, expected: 0},
+		{name: "multiple databases kept", keep: true, include: []string{"app_.*"}, expected: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Postgresql{
+				Log:                     testutil.Logger{},
+				Config:                  postgresql.Config{Address: config.NewSecret([]byte(server.address)), MaxIdle: 1, MaxOpen: 1},
+				NumericAsFloat:          true,
+				MaxConnections:          3,
+				KeepDatabaseConnections: tt.keep,
+				DatnameInclude:          tt.include,
+				Query: []query{
+					{Measurement: "q1", Sqlquery: "SELECT pg_sleep(0.1), 1 AS v"},
+					{Measurement: "q2", Sqlquery: "SELECT pg_sleep(0.1), 2 AS v"},
+					{Measurement: "q3", Sqlquery: "SELECT pg_sleep(0.1), 3 AS v"},
+				},
+			}
+			require.NoError(t, p.Init())
+
+			var acc testutil.Accumulator
+			require.NoError(t, p.Start(&acc))
+			defer p.Stop()
+			require.NoError(t, p.Gather(&acc))
+			require.Empty(t, acc.Errors)
+
+			// Give the server a moment to register closed sessions
+			time.Sleep(500 * time.Millisecond)
+			require.Equal(t, tt.expected, sessions())
+		})
+	}
 }
 
 func TestScriptIntegration(t *testing.T) {

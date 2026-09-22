@@ -75,12 +75,16 @@ to use them.
   ## the first collection after each interval boundary on the wall clock.
   # datname_refresh_interval = "5m"
 
-  ## Maximum number of queries to run concurrently. Each running query uses
-  ## a dedicated connection, so this is also the maximum number of open
-  ## connections.
+  ## Maximum number of connections used concurrently. With a single database
+  ## to query this many queries run concurrently in it. With several
+  ## databases this many databases are processed concurrently, running the
+  ## queries of each database sequentially on one connection.
   # max_connections = 1
 
-  ## Keep the connections to the databases open between collections.
+  ## Keep connections open between collections. By default all connections
+  ## are closed after a collection. If set, the connections to the connection
+  ## database are kept; the connection to a filtered database is always
+  ## closed as soon as its queries are done.
   # keep_database_connections = false
 
   ## Use all string columns as tags instead of fields. Queries may override this.
@@ -165,10 +169,22 @@ The plugin-level `timeout` limits a complete collection cycle. Each query
 is run with its own `timeout` if set, or the remaining time of the cycle
 otherwise.
 
-Queries are run concurrently in up to `max_connections` connections, each
-query in each database using one connection. Connections are only opened when
-needed, so two queries in one database never use more than two connections
-regardless of `max_connections`.
+With a single database to query, either the connection database or the only
+one matching the filters, the queries run with up to `max_connections`
+queries executing concurrently, each on its own connection.
+
+With several databases matching the filters up to `max_connections`
+databases are processed concurrently. The queries of a database run
+sequentially on a single connection, so the number of connections per
+collection equals the number of databases.
+
+The connection to a filtered database is closed as soon as its queries are
+done. By default the connections to the connection database are closed
+after the collection as well, so no connection stays open between
+collections. Set `keep_database_connections` to keep the connections to the
+connection database open until the next collection instead: all of them
+when it is the only database queried, the single one used for the server
+version, role and database list otherwise.
 
 ## Metrics
 

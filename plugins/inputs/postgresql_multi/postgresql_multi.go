@@ -50,9 +50,6 @@ type Postgresql struct {
 
 	datnames        []string
 	datnamesUpdated time.Time
-
-	dbServices   map[string]*postgresql.Service
-	dbServicesMu sync.Mutex
 }
 
 type query struct {
@@ -174,7 +171,6 @@ func (p *Postgresql) Init() error {
 		return err
 	}
 	p.service = service
-	p.dbServices = make(map[string]*postgresql.Service)
 
 	return nil
 }
@@ -185,9 +181,12 @@ func (p *Postgresql) Start(_ telegraf.Accumulator) error {
 	}
 
 	// Make sure the pool of the connection database allows the configured
-	// number of concurrent queries
+	// number of concurrent queries and reuses them within a collection
 	if p.MaxConnections > p.MaxOpen {
 		p.service.DB.SetMaxOpenConns(p.MaxConnections)
+	}
+	if p.MaxConnections > p.MaxIdle {
+		p.service.DB.SetMaxIdleConns(p.MaxConnections)
 	}
 
 	return nil
@@ -223,6 +222,16 @@ func (p *Postgresql) Gather(acc telegraf.Accumulator) error {
 		return nil
 	}
 
+	// set default timestamp to Now and use for all generated metrics during
+	// the same Gather call
+	timestamp := time.Now()
+
+	// Unless the connections should be kept, close the idle connections of
+	// the connection database after the collection
+	if !p.KeepDatabaseConnections {
+		defer p.closeIdleConnections()
+	}
+
 	// Determine the databases to run the queries in
 	datnames := []string{p.service.ConnectionDatabase}
 	if len(p.includeRegex) > 0 || len(p.excludeRegex) > 0 {
@@ -235,46 +244,106 @@ func (p *Postgresql) Gather(acc telegraf.Accumulator) error {
 		return nil
 	}
 
-	// set default timestamp to Now and use for all generated metrics during
-	// the same Gather call
-	timestamp := time.Now()
+	// A single database gets all connections: run the queries concurrently
+	if len(datnames) == 1 {
+		if err := p.gatherInDatabase(ctx, acc, datnames[0], queries, timestamp, p.MaxConnections); err != nil {
+			acc.AddError(fmt.Errorf("database %q: %w", datnames[0], err))
+		}
+		return nil
+	}
 
-	// Run all queries in all databases limiting the number of concurrent
-	// executions to the number of allowed connections. The semaphore is
-	// acquired before spawning the goroutine to avoid a large number of
-	// waiting goroutines when there are many databases and queries.
+	// Process up to max_connections databases concurrently, running the
+	// queries of each database sequentially on a single connection which is
+	// closed when done. The semaphore is acquired before spawning the
+	// goroutine to avoid a large number of waiting goroutines when there are
+	// many databases.
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, p.MaxConnections)
 	for _, datname := range datnames {
-		for _, q := range queries {
-			semaphore <- struct{}{}
-			wg.Add(1)
-			go func(j job) {
-				defer wg.Done()
-				defer func() { <-semaphore }()
+		semaphore <- struct{}{}
+		wg.Add(1)
+		go func(datname string) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
 
-				if err := p.gatherMetricsFromQuery(ctx, acc, j, timestamp); err != nil {
-					acc.AddError(fmt.Errorf("database %q: %w", j.datname, err))
-				}
-			}(job{datname: datname, query: q})
-		}
+			if err := p.gatherInDatabase(ctx, acc, datname, queries, timestamp, 1); err != nil {
+				acc.AddError(fmt.Errorf("database %q: %w", datname, err))
+			}
+		}(datname)
 	}
 	wg.Wait()
-
-	p.closeStaleServices(datnames)
 
 	return nil
 }
 
+// gatherInDatabase runs the queries in the given database with up to
+// concurrency queries executing at the same time. The connection database
+// uses the existing pool, any other database gets a pool of its own which
+// is closed when done.
+func (p *Postgresql) gatherInDatabase(
+	ctx context.Context,
+	acc telegraf.Accumulator,
+	datname string,
+	queries []*query,
+	timestamp time.Time,
+	concurrency int,
+) error {
+	service := p.service
+	if datname != p.service.ConnectionDatabase {
+		var err error
+		service, err = p.Config.CreateServiceForDatabase(datname)
+		if err != nil {
+			return err
+		}
+		if err := service.Start(); err != nil {
+			return err
+		}
+		defer service.Stop()
+		service.DB.SetMaxOpenConns(concurrency)
+		service.DB.SetMaxIdleConns(concurrency)
+	}
+
+	p.gatherDatabase(ctx, acc, service, datname, queries, timestamp, concurrency)
+	return nil
+}
+
+// closeIdleConnections closes the idle connections of the connection
+// database by temporarily dropping the idle limit of the pool
+func (p *Postgresql) closeIdleConnections() {
+	p.service.DB.SetMaxIdleConns(0)
+	p.service.DB.SetMaxIdleConns(max(p.MaxIdle, p.MaxConnections))
+}
+
+// gatherDatabase runs the queries in one database with the given number of
+// queries executing concurrently
+func (p *Postgresql) gatherDatabase(
+	ctx context.Context,
+	acc telegraf.Accumulator,
+	service *postgresql.Service,
+	datname string,
+	queries []*query,
+	timestamp time.Time,
+	concurrency int,
+) {
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, concurrency)
+	for _, q := range queries {
+		semaphore <- struct{}{}
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			if err := p.gatherMetricsFromQuery(ctx, acc, service, j, timestamp); err != nil {
+				acc.AddError(fmt.Errorf("database %q: %w", j.datname, err))
+			}
+		}(job{datname: datname, query: q})
+	}
+	wg.Wait()
+}
+
 func (p *Postgresql) Stop() {
 	p.service.Stop()
-
-	p.dbServicesMu.Lock()
-	defer p.dbServicesMu.Unlock()
-	for name, service := range p.dbServices {
-		service.Stop()
-		delete(p.dbServices, name)
-	}
 }
 
 // refreshDatnames updates the list of databases matching the filters if a
@@ -335,59 +404,13 @@ func (p *Postgresql) matchesDatname(datname string) bool {
 	return true
 }
 
-// getService returns the service for the given database, creating it on
-// first use. The service for the connection database is reused.
-func (p *Postgresql) getService(datname string) (*postgresql.Service, error) {
-	if datname == p.service.ConnectionDatabase {
-		return p.service, nil
-	}
-
-	p.dbServicesMu.Lock()
-	defer p.dbServicesMu.Unlock()
-
-	if service, found := p.dbServices[datname]; found {
-		return service, nil
-	}
-
-	service, err := p.Config.CreateServiceForDatabase(datname)
-	if err != nil {
-		return nil, err
-	}
-	if err := service.Start(); err != nil {
-		return nil, err
-	}
-	service.DB.SetMaxOpenConns(p.MaxConnections)
-	if !p.KeepDatabaseConnections {
-		service.DB.SetMaxIdleConns(0)
-	}
-	p.dbServices[datname] = service
-
-	return service, nil
-}
-
-// closeStaleServices closes the services of databases no longer in the list
-func (p *Postgresql) closeStaleServices(datnames []string) {
-	current := make(map[string]bool, len(datnames))
-	for _, datname := range datnames {
-		current[datname] = true
-	}
-
-	p.dbServicesMu.Lock()
-	defer p.dbServicesMu.Unlock()
-	for name, service := range p.dbServices {
-		if !current[name] {
-			service.Stop()
-			delete(p.dbServices, name)
-		}
-	}
-}
-
-func (p *Postgresql) gatherMetricsFromQuery(ctx context.Context, acc telegraf.Accumulator, j job, timestamp time.Time) error {
-	service, err := p.getService(j.datname)
-	if err != nil {
-		return err
-	}
-
+func (p *Postgresql) gatherMetricsFromQuery(
+	ctx context.Context,
+	acc telegraf.Accumulator,
+	service *postgresql.Service,
+	j job,
+	timestamp time.Time,
+) error {
 	if j.query.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(j.query.Timeout))
