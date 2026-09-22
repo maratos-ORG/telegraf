@@ -31,7 +31,6 @@ func newPlugin() *Postgresql {
 		},
 		PreparedStatements: true,
 		NumericAsFloat:     true,
-		IgnoredColumns:     []string{"stats_reset"},
 	}
 }
 
@@ -50,7 +49,6 @@ func TestInitDefaults(t *testing.T) {
 	require.Equal(t, "any", q.Role)
 	require.False(t, q.stringTags)
 	require.True(t, q.numericFloat)
-	require.True(t, q.ignoredColumns["stats_reset"])
 }
 
 // TestRegisteredDefaults pins the defaults an existing postgresql_extensible
@@ -71,7 +69,6 @@ func TestRegisteredDefaults(t *testing.T) {
 	require.False(t, p.StringColumnsAsTags)
 	require.True(t, p.KeepDatabaseConnections)
 	require.True(t, p.PreparedStatements)
-	require.Equal(t, []string{"stats_reset"}, p.IgnoredColumns)
 	require.Equal(t, 1, p.MaxIdle)
 	require.Equal(t, 1, p.MaxOpen)
 }
@@ -134,7 +131,6 @@ func TestInitQueryOverrides(t *testing.T) {
 			Role:                "replica",
 			StringColumnsAsTags: boolPtr(false),
 			NumericAsFloat:      boolPtr(false),
-			IgnoredColumns:      []string{"query"},
 		},
 	}
 	require.NoError(t, p.Init())
@@ -143,14 +139,11 @@ func TestInitQueryOverrides(t *testing.T) {
 	require.Equal(t, "primary", inherited.Role)
 	require.True(t, inherited.stringTags)
 	require.True(t, inherited.numericFloat)
-	require.False(t, inherited.ignoredColumns["query"])
 
 	overridden := p.Query[1]
 	require.Equal(t, "replica", overridden.Role)
 	require.False(t, overridden.stringTags)
 	require.False(t, overridden.numericFloat)
-	require.True(t, overridden.ignoredColumns["query"])
-	require.True(t, overridden.ignoredColumns["stats_reset"])
 }
 
 func TestInitScript(t *testing.T) {
@@ -325,10 +318,9 @@ func TestAccRow(t *testing.T) {
 			expectedFields: map[string]interface{}{"datname": 1, "cat": "gato"},
 		},
 		{
-			name:    "null and ignored columns are skipped",
-			query:   query{IgnoredColumns: []string{"secret"}},
-			columns: []string{"stats_reset", "secret", "nothing", "value"},
-			row:     fakeRow{fields: []interface{}{time.Now(), "hidden", nil, int64(42)}},
+			name:    "null and stats_reset columns are skipped",
+			columns: []string{"stats_reset", "nothing", "value"},
+			row:     fakeRow{fields: []interface{}{time.Now(), nil, int64(42)}},
 			expectedTags: map[string]string{
 				"server": "server",
 				"db":     "mydb",
@@ -596,7 +588,6 @@ func TestGeneratesMetricsIntegration(t *testing.T) {
 
 	acc := server.run(t, &Postgresql{
 		NumericAsFloat: true,
-		IgnoredColumns: []string{"stats_reset"},
 		Query: []query{{
 			Sqlquery:   "SELECT * FROM pg_stat_database WHERE datname = 'postgres'",
 			MinVersion: 901,

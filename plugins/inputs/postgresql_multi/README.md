@@ -97,9 +97,6 @@ to use them.
   ## fields. Queries may override this.
   # numeric_as_float = false
 
-  ## Columns to ignore completely. Queries may add columns to this list.
-  # ignored_columns = ["stats_reset"]
-
   ## Queries to run
   ##
   ## The sqlquery option contains the SQL text to run, the script option a
@@ -120,8 +117,8 @@ to use them.
   ## The timeout option limits the runtime of the query and defaults to the
   ## remaining time of the collection cycle.
   ##
-  ## The role, string_columns_as_tags, numeric_as_float and ignored_columns
-  ## options override the plugin-level settings for this query.
+  ## The role, string_columns_as_tags and numeric_as_float options override
+  ## the plugin-level settings for this query.
   [[inputs.postgresql_multi.query]]
     measurement = "pg_stat_database"
     sqlquery = "SELECT * FROM pg_stat_database"
@@ -130,8 +127,7 @@ to use them.
     # timeout = "10s"
     # role = "any"
     # string_columns_as_tags = false
-    # numeric_as_float = true
-    # ignored_columns = []
+    # numeric_as_float = false
   [[inputs.postgresql_multi.query]]
     script = "your_sql-filepath.sql"
     min_version = 901
@@ -223,6 +219,9 @@ By default, the following format is used
   * fields:
     * all remaining columns; `numeric` columns are converted to floats if
       `numeric_as_float` is set
+
+The `stats_reset` column is never reported. To drop further columns use the
+`fieldexclude` and `tagexclude` options every input plugin supports.
 
 ## Example Output
 

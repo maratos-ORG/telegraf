@@ -27,6 +27,9 @@ import (
 //go:embed sample.conf
 var sampleConfig string
 
+// Columns never reported as a field or tag
+var ignoredColumns = map[string]bool{"stats_reset": true}
+
 type Postgresql struct {
 	Databases               []string        `deprecated:"1.22.4;use the sqlquery option to specify database to use"`
 	Query                   []query         `toml:"query"`
@@ -40,7 +43,6 @@ type Postgresql struct {
 	KeepDatabaseConnections bool            `toml:"keep_database_connections"`
 	StringColumnsAsTags     bool            `toml:"string_columns_as_tags"`
 	NumericAsFloat          bool            `toml:"numeric_as_float"`
-	IgnoredColumns          []string        `toml:"ignored_columns"`
 	Log                     telegraf.Logger `toml:"-"`
 	postgresql.Config
 
@@ -69,10 +71,8 @@ type query struct {
 	Role                string          `toml:"role"`
 	StringColumnsAsTags *bool           `toml:"string_columns_as_tags"`
 	NumericAsFloat      *bool           `toml:"numeric_as_float"`
-	IgnoredColumns      []string        `toml:"ignored_columns"`
 
 	additionalTags map[string]bool
-	ignoredColumns map[string]bool
 	stringTags     bool
 	numericFloat   bool
 }
@@ -157,14 +157,6 @@ func (p *Postgresql) Init() error {
 		q.numericFloat = p.NumericAsFloat
 		if q.NumericAsFloat != nil {
 			q.numericFloat = *q.NumericAsFloat
-		}
-
-		q.ignoredColumns = make(map[string]bool, len(p.IgnoredColumns)+len(q.IgnoredColumns))
-		for _, col := range p.IgnoredColumns {
-			q.ignoredColumns[col] = true
-		}
-		for _, col := range q.IgnoredColumns {
-			q.ignoredColumns[col] = true
 		}
 
 		q.additionalTags = make(map[string]bool)
@@ -522,7 +514,7 @@ func (p *Postgresql) accRow(
 	fields := make(map[string]interface{})
 	for col, val := range columnMap {
 		p.Log.Debugf("Column: %s = %T: %v\n", col, *val, *val)
-		if q.ignoredColumns[col] || *val == nil {
+		if ignoredColumns[col] || *val == nil {
 			continue
 		}
 
@@ -642,7 +634,6 @@ func init() {
 			},
 			PreparedStatements:      true,
 			KeepDatabaseConnections: true,
-			IgnoredColumns:          []string{"stats_reset"},
 		}
 	})
 }
