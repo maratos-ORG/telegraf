@@ -28,6 +28,7 @@ import (
 var sampleConfig string
 
 type Postgresql struct {
+	Databases               []string        `deprecated:"1.22.4;use the sqlquery option to specify database to use"`
 	Query                   []query         `toml:"query"`
 	PreparedStatements      bool            `toml:"prepared_statements"`
 	Timeout                 config.Duration `toml:"timeout"`
@@ -57,11 +58,13 @@ type Postgresql struct {
 type query struct {
 	Sqlquery            string          `toml:"sqlquery"`
 	Script              string          `toml:"script"`
+	Version             int             `deprecated:"1.28.0;use min_version to specify minimal DB version this query supports"`
 	MinVersion          int             `toml:"min_version"`
 	MaxVersion          int             `toml:"max_version"`
 	Tagvalue            string          `toml:"tagvalue"`
 	Measurement         string          `toml:"measurement"`
 	Timestamp           string          `toml:"timestamp"`
+	Withdbname          bool            `deprecated:"1.22.4;use the sqlquery option to specify database to use"`
 	Timeout             config.Duration `toml:"timeout"`
 	Role                string          `toml:"role"`
 	StringColumnsAsTags *bool           `toml:"string_columns_as_tags"`
@@ -89,12 +92,6 @@ func (*Postgresql) SampleConfig() string {
 }
 
 func (p *Postgresql) Init() error {
-	if p.Timeout <= 0 {
-		p.Timeout = config.Duration(60 * time.Second)
-	}
-	if p.MetadataRefreshInterval <= 0 {
-		p.MetadataRefreshInterval = config.Duration(5 * time.Minute)
-	}
 	if p.MaxConnections <= 0 {
 		p.MaxConnections = 1
 	}
@@ -130,8 +127,21 @@ func (p *Postgresql) Init() error {
 			}
 			q.Sqlquery = string(query)
 		}
+		if q.MinVersion == 0 {
+			q.MinVersion = q.Version
+		}
 		if q.Measurement == "" {
 			q.Measurement = "postgresql"
+		}
+
+		// Complete a query ending in "WHERE datname" with the deprecated
+		// list of databases
+		if q.Withdbname {
+			if len(p.Databases) != 0 {
+				q.Sqlquery += fmt.Sprintf(` IN ('%s')`, strings.Join(p.Databases, "','"))
+			} else {
+				q.Sqlquery += " is not null"
+			}
 		}
 		if err := validateRole(q.Role); err != nil {
 			return fmt.Errorf("query %d: %w", i, err)
@@ -195,7 +205,11 @@ func (p *Postgresql) Start(_ telegraf.Accumulator) error {
 }
 
 func (p *Postgresql) Gather(acc telegraf.Accumulator) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.Timeout))
+	// A timeout of zero means no limit on the duration of a collection
+	ctx, cancel := context.WithCancel(context.Background())
+	if p.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(p.Timeout))
+	}
 	defer cancel()
 
 	// Refresh the cached server version, role and database list if due
@@ -626,9 +640,9 @@ func init() {
 				MaxIdle: 1,
 				MaxOpen: 1,
 			},
-			PreparedStatements: true,
-			NumericAsFloat:     true,
-			IgnoredColumns:     []string{"stats_reset"},
+			PreparedStatements:      true,
+			KeepDatabaseConnections: true,
+			IgnoredColumns:          []string{"stats_reset"},
 		}
 	})
 }

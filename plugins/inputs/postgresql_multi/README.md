@@ -57,7 +57,8 @@ to use them.
 
   ## Timeout for a complete collection cycle, i.e. all queries in all
   ## databases. Individual queries may specify a shorter timeout.
-  # timeout = "60s"
+  ## Zero means no limit on the duration of a collection.
+  # timeout = "0s"
 
   ## Server role required to run the queries. Queries may override this.
   ## Valid values are "any", "primary" and "replica". The role is determined
@@ -75,7 +76,8 @@ to use them.
   ## list of databases. They are cached and refreshed on the first collection
   ## after each interval boundary on the wall clock, so a collection between
   ## two refreshes does not query the connection database at all.
-  # metadata_refresh_interval = "5m"
+  ## Zero reads them on every collection.
+  # metadata_refresh_interval = "0s"
 
   ## Maximum number of connections used concurrently. With a single database
   ## to query this many queries run concurrently in it. With several
@@ -83,17 +85,17 @@ to use them.
   ## queries of each database sequentially on one connection.
   # max_connections = 1
 
-  ## Keep connections open between collections. By default all connections
-  ## are closed after a collection. If set, the connections to the connection
-  ## database are kept; the connection to a filtered database is always
-  ## closed as soon as its queries are done.
-  # keep_database_connections = false
+  ## Keep connections open between collections. If unset, all connections
+  ## are closed after a collection. The connection to a filtered database is
+  ## always closed as soon as its queries are done.
+  # keep_database_connections = true
 
   ## Use all string columns as tags instead of fields. Queries may override this.
   # string_columns_as_tags = false
 
-  ## Convert numeric columns to floating point fields. Queries may override this.
-  # numeric_as_float = true
+  ## Convert numeric columns to floating point fields instead of string
+  ## fields. Queries may override this.
+  # numeric_as_float = false
 
   ## Columns to ignore completely. Queries may add columns to this list.
   # ignored_columns = ["stats_reset"]
@@ -170,7 +172,17 @@ together and cached for `metadata_refresh_interval`. A collection between
 two refreshes uses the cached values and does not query the connection
 database at all. After a role change the plugin therefore keeps using the
 previous role for up to one refresh interval, so choose the interval short
-enough for how fast a promoted server should be picked up.
+enough for how fast a promoted server should be picked up. The default of
+zero reads them on every collection.
+
+## Defaults
+
+The defaults match the behavior of the [postgresql_extensible][inputs_pgext]
+plugin, so a configuration of that plugin produces the same metrics here:
+no timeout, no caching of the server information, `numeric` columns as
+string fields and the connection kept open between collections. The
+deprecated `databases`, `withdbname` and `version` options are accepted as
+well.
 
 ## Timeouts and concurrency
 

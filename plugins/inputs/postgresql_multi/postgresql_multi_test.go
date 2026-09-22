@@ -16,6 +16,7 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/common/postgresql"
+	"github.com/influxdata/telegraf/plugins/inputs"
 	"github.com/influxdata/telegraf/testutil"
 )
 
@@ -39,8 +40,8 @@ func TestInitDefaults(t *testing.T) {
 	p.Query = []query{{Sqlquery: "SELECT 1"}}
 	require.NoError(t, p.Init())
 
-	require.Equal(t, config.Duration(60*time.Second), p.Timeout)
-	require.Equal(t, config.Duration(5*time.Minute), p.MetadataRefreshInterval)
+	require.Zero(t, p.Timeout)
+	require.Zero(t, p.MetadataRefreshInterval)
 	require.Equal(t, 1, p.MaxConnections)
 	require.Equal(t, "any", p.Role)
 
@@ -50,6 +51,75 @@ func TestInitDefaults(t *testing.T) {
 	require.False(t, q.stringTags)
 	require.True(t, q.numericFloat)
 	require.True(t, q.ignoredColumns["stats_reset"])
+}
+
+// TestRegisteredDefaults pins the defaults an existing postgresql_extensible
+// configuration relies on: no timeout, no caching, numeric columns as
+// strings and the connection kept between collections.
+func TestRegisteredDefaults(t *testing.T) {
+	creator, found := inputs.Inputs["postgresql_multi"]
+	require.True(t, found)
+
+	p, ok := creator().(*Postgresql)
+	require.True(t, ok)
+
+	require.Zero(t, p.Timeout)
+	require.Zero(t, p.MetadataRefreshInterval)
+	require.Zero(t, p.MaxConnections)
+	require.Zero(t, p.Role)
+	require.False(t, p.NumericAsFloat)
+	require.False(t, p.StringColumnsAsTags)
+	require.True(t, p.KeepDatabaseConnections)
+	require.True(t, p.PreparedStatements)
+	require.Equal(t, []string{"stats_reset"}, p.IgnoredColumns)
+	require.Equal(t, 1, p.MaxIdle)
+	require.Equal(t, 1, p.MaxOpen)
+}
+
+func TestInitDeprecatedOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		databases []string
+		query     query
+		expected  string
+	}{
+		{
+			name:     "version replaces min_version",
+			query:    query{Sqlquery: "SELECT 1", Version: 901},
+			expected: "SELECT 1",
+		},
+		{
+			name:     "withdbname without databases",
+			query:    query{Sqlquery: "SELECT * FROM pg_stat_database WHERE datname", Withdbname: true},
+			expected: "SELECT * FROM pg_stat_database WHERE datname is not null",
+		},
+		{
+			name:      "withdbname with databases",
+			databases: []string{"app_1", "app_2"},
+			query:     query{Sqlquery: "SELECT * FROM pg_stat_database WHERE datname", Withdbname: true},
+			expected:  "SELECT * FROM pg_stat_database WHERE datname IN ('app_1','app_2')",
+		},
+		{
+			name:      "databases without withdbname",
+			databases: []string{"app_1"},
+			query:     query{Sqlquery: "SELECT 1"},
+			expected:  "SELECT 1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newPlugin()
+			p.Databases = tt.databases
+			p.Query = []query{tt.query}
+			require.NoError(t, p.Init())
+
+			require.Equal(t, tt.expected, p.Query[0].Sqlquery)
+			if tt.query.Version != 0 {
+				require.Equal(t, tt.query.Version, p.Query[0].MinVersion)
+			}
+		})
+	}
 }
 
 func TestInitQueryOverrides(t *testing.T) {
@@ -366,6 +436,7 @@ func TestAccRow(t *testing.T) {
 
 func TestMetadataCached(t *testing.T) {
 	p := newPlugin()
+	p.MetadataRefreshInterval = config.Duration(time.Hour)
 	require.NoError(t, p.Init())
 
 	// The pool is not started, so any query would panic on a nil database
@@ -378,6 +449,15 @@ func TestMetadataCached(t *testing.T) {
 	require.Equal(t, 1700, p.dbVersion)
 	require.True(t, p.inRecovery)
 	require.Equal(t, []string{"app_1"}, p.datnames)
+}
+
+func TestMetadataNotCachedByDefault(t *testing.T) {
+	p := newPlugin()
+	require.NoError(t, p.Init())
+	require.Zero(t, p.MetadataRefreshInterval)
+
+	// A zero interval makes every collection read the server information
+	require.True(t, refreshDue(time.Now(), time.Now(), time.Duration(p.MetadataRefreshInterval)))
 }
 
 func TestRefreshDue(t *testing.T) {
