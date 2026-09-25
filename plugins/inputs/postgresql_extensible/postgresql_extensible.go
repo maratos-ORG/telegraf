@@ -2,17 +2,21 @@
 package postgresql_extensible
 
 import (
-	"bytes"
+	"context"
 	_ "embed"
 	"fmt"
+	"math"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	// Required for SQL framework driver
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/common/postgresql"
 	"github.com/influxdata/telegraf/plugins/inputs"
@@ -21,34 +25,60 @@ import (
 //go:embed sample.conf
 var sampleConfig string
 
+// Columns never reported as a field or tag
 var ignoredColumns = map[string]bool{"stats_reset": true}
 
 type Postgresql struct {
-	Databases          []string        `deprecated:"1.22.4;use the sqlquery option to specify database to use"`
-	Query              []query         `toml:"query"`
-	PreparedStatements bool            `toml:"prepared_statements"`
-	Log                telegraf.Logger `toml:"-"`
+	Databases               []string        `deprecated:"1.22.4;use the sqlquery option to specify database to use"`
+	Query                   []query         `toml:"query"`
+	PreparedStatements      bool            `toml:"prepared_statements"`
+	Timeout                 config.Duration `toml:"timeout"`
+	Role                    string          `toml:"role"`
+	DatnameInclude          []string        `toml:"datname_include"`
+	DatnameExclude          []string        `toml:"datname_exclude"`
+	MetadataRefreshInterval config.Duration `toml:"metadata_refresh_interval"`
+	MaxConnections          int             `toml:"max_connections"`
+	KeepIdleConnections     bool            `toml:"keep_idle_connections"`
+	StringColumnsAsTags     bool            `toml:"string_columns_as_tags"`
+	NumericAsFloat          bool            `toml:"numeric_as_float"`
+	Log                     telegraf.Logger `toml:"-"`
 	postgresql.Config
 
 	service *postgresql.Service
+
+	includeRegex []*regexp.Regexp
+	excludeRegex []*regexp.Regexp
+
+	dbVersion       int
+	inRecovery      bool
+	datnames        []string
+	metadataUpdated time.Time
 }
 
 type query struct {
-	Sqlquery    string `toml:"sqlquery"`
-	Script      string `toml:"script"`
-	Version     int    `deprecated:"1.28.0;use minVersion to specify minimal DB version this query supports"`
-	MinVersion  int    `toml:"min_version"`
-	MaxVersion  int    `toml:"max_version"`
-	Withdbname  bool   `deprecated:"1.22.4;use the sqlquery option to specify database to use"`
-	Tagvalue    string `toml:"tagvalue"`
-	Measurement string `toml:"measurement"`
-	Timestamp   string `toml:"timestamp"`
+	Sqlquery            string          `toml:"sqlquery"`
+	Script              string          `toml:"script"`
+	Version             int             `deprecated:"1.28.0;use minVersion to specify minimal DB version this query supports"`
+	MinVersion          int             `toml:"min_version"`
+	MaxVersion          int             `toml:"max_version"`
+	Tagvalue            string          `toml:"tagvalue"`
+	Measurement         string          `toml:"measurement"`
+	Timestamp           string          `toml:"timestamp"`
+	Withdbname          bool            `deprecated:"1.22.4;use the sqlquery option to specify database to use"`
+	Timeout             config.Duration `toml:"timeout"`
+	Role                string          `toml:"role"`
+	StringColumnsAsTags *bool           `toml:"string_columns_as_tags"`
+	NumericAsFloat      *bool           `toml:"numeric_as_float"`
 
 	additionalTags map[string]bool
+	stringTags     bool
+	numericFloat   bool
 }
 
-type scanner interface {
-	Scan(dest ...interface{}) error
+// job is a single unit of work: one query executed in one database
+type job struct {
+	datname string
+	query   *query
 }
 
 func (*Postgresql) SampleConfig() string {
@@ -56,6 +86,32 @@ func (*Postgresql) SampleConfig() string {
 }
 
 func (p *Postgresql) Init() error {
+	if p.MaxConnections <= 0 {
+		p.MaxConnections = 1
+	}
+	if err := validateRole(p.Role); err != nil {
+		return err
+	}
+	if p.Role == "" {
+		p.Role = "any"
+	}
+
+	// Compile the database name filters
+	for _, pattern := range p.DatnameInclude {
+		re, err := regexp.Compile("^(?:" + pattern + ")$")
+		if err != nil {
+			return fmt.Errorf("compiling datname_include %q failed: %w", pattern, err)
+		}
+		p.includeRegex = append(p.includeRegex, re)
+	}
+	for _, pattern := range p.DatnameExclude {
+		re, err := regexp.Compile("^(?:" + pattern + ")$")
+		if err != nil {
+			return fmt.Errorf("compiling datname_exclude %q failed: %w", pattern, err)
+		}
+		p.excludeRegex = append(p.excludeRegex, re)
+	}
+
 	// Set defaults for the queries
 	for i, q := range p.Query {
 		if q.Sqlquery == "" {
@@ -72,15 +128,30 @@ func (p *Postgresql) Init() error {
 			q.Measurement = "postgresql"
 		}
 
-		var queryAddon string
+		// Complete a query ending in "WHERE datname" with the deprecated
+		// list of databases
 		if q.Withdbname {
 			if len(p.Databases) != 0 {
-				queryAddon = fmt.Sprintf(` IN ('%s')`, strings.Join(p.Databases, "','"))
+				q.Sqlquery += fmt.Sprintf(` IN ('%s')`, strings.Join(p.Databases, "','"))
 			} else {
-				queryAddon = " is not null"
+				q.Sqlquery += " is not null"
 			}
 		}
-		q.Sqlquery += queryAddon
+		if err := validateRole(q.Role); err != nil {
+			return fmt.Errorf("query %d: %w", i, err)
+		}
+		if q.Role == "" {
+			q.Role = p.Role
+		}
+
+		q.stringTags = p.StringColumnsAsTags
+		if q.StringColumnsAsTags != nil {
+			q.stringTags = *q.StringColumnsAsTags
+		}
+		q.numericFloat = p.NumericAsFloat
+		if q.NumericAsFloat != nil {
+			q.numericFloat = *q.NumericAsFloat
+		}
 
 		q.additionalTags = make(map[string]bool)
 		if q.Tagvalue != "" {
@@ -103,41 +174,275 @@ func (p *Postgresql) Init() error {
 }
 
 func (p *Postgresql) Start(_ telegraf.Accumulator) error {
-	return p.service.Start()
+	if err := p.service.Start(); err != nil {
+		return err
+	}
+
+	// Make sure the pool of the connection database allows the configured
+	// number of concurrent queries and reuses them within a collection. This
+	// overrides the undocumented max_open and max_idle options of the shared
+	// PostgreSQL configuration, max_connections is the documented way to size
+	// the pool of this plugin.
+	if p.MaxConnections > p.MaxOpen {
+		p.Log.Debugf("Raising max_open from %d to max_connections %d", p.MaxOpen, p.MaxConnections)
+		p.service.DB.SetMaxOpenConns(p.MaxConnections)
+	}
+	if p.MaxConnections > p.MaxIdle {
+		p.Log.Debugf("Raising max_idle from %d to max_connections %d", p.MaxIdle, p.MaxConnections)
+		p.service.DB.SetMaxIdleConns(p.MaxConnections)
+	}
+
+	return nil
 }
 
 func (p *Postgresql) Gather(acc telegraf.Accumulator) error {
-	// Retrieving the database version
-	query := `SELECT setting::integer / 100 AS version FROM pg_settings WHERE name = 'server_version_num'`
-	var dbVersion int
-	if err := p.service.DB.QueryRow(query).Scan(&dbVersion); err != nil {
-		dbVersion = 0
+	// A timeout of zero means no limit on the duration of a collection
+	ctx, cancel := context.WithCancel(context.Background())
+	if p.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(p.Timeout))
+	}
+	defer cancel()
+
+	// Refresh the cached server version, role and database list if due
+	if err := p.refreshMetadata(ctx); err != nil {
+		acc.AddError(err)
+	}
+	if p.dbVersion == 0 {
+		// The server information was never read successfully
+		return nil
+	}
+
+	// Select the queries to run for this server version and role
+	queries := make([]*query, 0, len(p.Query))
+	for i := range p.Query {
+		q := &p.Query[i]
+		if !matchesVersion(q, p.dbVersion) {
+			continue
+		}
+		if !matchesRole(q.Role, p.inRecovery) {
+			p.Log.Debugf("Skipping query %q as the server role does not match %q", q.Measurement, q.Role)
+			continue
+		}
+		queries = append(queries, q)
+	}
+	if len(queries) == 0 {
+		return nil
 	}
 
 	// set default timestamp to Now and use for all generated metrics during
 	// the same Gather call
 	timestamp := time.Now()
 
-	// We loop in order to process each query
-	// Query is not run if Database version does not match the query version.
-	for _, q := range p.Query {
-		if q.MinVersion <= dbVersion && (q.MaxVersion == 0 || q.MaxVersion > dbVersion) {
-			acc.AddError(p.gatherMetricsFromQuery(acc, q, timestamp))
-		}
+	// Unless the connections should be kept, close the idle connections of
+	// the connection database after the collection
+	if !p.KeepIdleConnections {
+		defer p.closeIdleConnections()
 	}
+
+	// Determine the databases to run the queries in
+	datnames := []string{p.service.ConnectionDatabase}
+	if len(p.includeRegex) > 0 || len(p.excludeRegex) > 0 {
+		datnames = p.datnames
+	}
+	if len(datnames) == 0 {
+		return nil
+	}
+
+	// A single database gets all connections: run the queries concurrently
+	if len(datnames) == 1 {
+		if err := p.gatherInDatabase(ctx, acc, datnames[0], queries, timestamp, p.MaxConnections); err != nil {
+			acc.AddError(fmt.Errorf("database %q: %w", datnames[0], err))
+		}
+		return nil
+	}
+
+	// Process up to max_connections databases concurrently, running the
+	// queries of each database sequentially on a single connection which is
+	// closed when done. The semaphore is acquired before spawning the
+	// goroutine to avoid a large number of waiting goroutines when there are
+	// many databases.
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, p.MaxConnections)
+	for _, datname := range datnames {
+		semaphore <- struct{}{}
+		wg.Add(1)
+		go func(datname string) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			if err := p.gatherInDatabase(ctx, acc, datname, queries, timestamp, 1); err != nil {
+				acc.AddError(fmt.Errorf("database %q: %w", datname, err))
+			}
+		}(datname)
+	}
+	wg.Wait()
+
 	return nil
+}
+
+// gatherInDatabase runs the queries in the given database with up to
+// concurrency queries executing at the same time. The connection database
+// uses the existing pool, any other database gets a pool of its own which
+// is closed when done.
+func (p *Postgresql) gatherInDatabase(
+	ctx context.Context,
+	acc telegraf.Accumulator,
+	datname string,
+	queries []*query,
+	timestamp time.Time,
+	concurrency int,
+) error {
+	service := p.service
+	if datname != p.service.ConnectionDatabase {
+		var err error
+		service, err = p.Config.CreateServiceForDatabase(datname)
+		if err != nil {
+			return err
+		}
+		if err := service.Start(); err != nil {
+			return err
+		}
+		defer service.Stop()
+		service.DB.SetMaxOpenConns(concurrency)
+		service.DB.SetMaxIdleConns(concurrency)
+	}
+
+	p.gatherDatabase(ctx, acc, service, datname, queries, timestamp, concurrency)
+	return nil
+}
+
+// closeIdleConnections closes the idle connections of the connection
+// database by temporarily dropping the idle limit of the pool
+func (p *Postgresql) closeIdleConnections() {
+	p.service.DB.SetMaxIdleConns(0)
+	p.service.DB.SetMaxIdleConns(max(p.MaxIdle, p.MaxConnections))
+}
+
+// gatherDatabase runs the queries in one database with the given number of
+// queries executing concurrently
+func (p *Postgresql) gatherDatabase(
+	ctx context.Context,
+	acc telegraf.Accumulator,
+	service *postgresql.Service,
+	datname string,
+	queries []*query,
+	timestamp time.Time,
+	concurrency int,
+) {
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, concurrency)
+	for _, q := range queries {
+		semaphore <- struct{}{}
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			if err := p.gatherMetricsFromQuery(ctx, acc, service, j, timestamp); err != nil {
+				acc.AddError(fmt.Errorf("database %q: %w", j.datname, err))
+			}
+		}(job{datname: datname, query: q})
+	}
+	wg.Wait()
 }
 
 func (p *Postgresql) Stop() {
 	p.service.Stop()
 }
 
-func (p *Postgresql) gatherMetricsFromQuery(acc telegraf.Accumulator, q query, timestamp time.Time) error {
-	rows, err := p.service.DB.Query(q.Sqlquery)
-	if err != nil {
-		return err
+// refreshMetadata updates the cached server version, role and list of
+// databases if a refresh is due. Caching them keeps the collections between
+// two refreshes from connecting to the connection database at all.
+func (p *Postgresql) refreshMetadata(ctx context.Context) error {
+	if !refreshDue(p.metadataUpdated, time.Now(), time.Duration(p.MetadataRefreshInterval)) {
+		return nil
 	}
 
+	row := p.service.DB.QueryRowContext(ctx,
+		`SELECT setting::integer / 100, pg_is_in_recovery() FROM pg_settings WHERE name = 'server_version_num'`)
+	if err := row.Scan(&p.dbVersion, &p.inRecovery); err != nil {
+		return fmt.Errorf("querying server version and role failed: %w", err)
+	}
+
+	if len(p.includeRegex) > 0 || len(p.excludeRegex) > 0 {
+		if err := p.refreshDatnames(ctx); err != nil {
+			return err
+		}
+	}
+
+	p.metadataUpdated = time.Now()
+	return nil
+}
+
+// refreshDatnames updates the list of databases matching the filters
+func (p *Postgresql) refreshDatnames(ctx context.Context) error {
+	rows, err := p.service.DB.QueryContext(ctx,
+		`SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname`)
+	if err != nil {
+		return fmt.Errorf("querying database list failed: %w", err)
+	}
+	defer rows.Close()
+
+	datnames := make([]string, 0)
+	for rows.Next() {
+		var datname string
+		if err := rows.Scan(&datname); err != nil {
+			return fmt.Errorf("scanning database list failed: %w", err)
+		}
+		if p.matchesDatname(datname) {
+			datnames = append(datnames, datname)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reading database list failed: %w", err)
+	}
+
+	if len(datnames) == 0 {
+		p.Log.Warn("No database matches the datname_include/datname_exclude filters")
+	}
+	p.datnames = datnames
+
+	return nil
+}
+
+func (p *Postgresql) matchesDatname(datname string) bool {
+	if len(p.includeRegex) > 0 {
+		var included bool
+		for _, re := range p.includeRegex {
+			if re.MatchString(datname) {
+				included = true
+				break
+			}
+		}
+		if !included {
+			return false
+		}
+	}
+	for _, re := range p.excludeRegex {
+		if re.MatchString(datname) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Postgresql) gatherMetricsFromQuery(
+	ctx context.Context,
+	acc telegraf.Accumulator,
+	service *postgresql.Service,
+	j job,
+	timestamp time.Time,
+) error {
+	if j.query.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(j.query.Timeout))
+		defer cancel()
+	}
+
+	rows, err := service.DB.QueryContext(ctx, j.query.Sqlquery)
+	if err != nil {
+		return fmt.Errorf("query %q: %w", j.query.Measurement, err)
+	}
 	defer rows.Close()
 
 	// grab the column information from the result
@@ -145,70 +450,84 @@ func (p *Postgresql) gatherMetricsFromQuery(acc telegraf.Accumulator, q query, t
 	if err != nil {
 		return err
 	}
-
-	for rows.Next() {
-		if err := p.accRow(acc, rows, columns, q, timestamp); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (p *Postgresql) accRow(acc telegraf.Accumulator, row scanner, columns []string, q query, timestamp time.Time) error {
-	// this is where we'll store the column name with its *interface{}
-	columnMap := make(map[string]*interface{})
-
-	for _, column := range columns {
-		columnMap[column] = new(interface{})
-	}
-
-	columnVars := make([]interface{}, 0, len(columnMap))
-	// populate the array of interface{} with the pointers in the right order
-	for i := 0; i < len(columnMap); i++ {
-		columnVars = append(columnVars, columnMap[columns[i]])
-	}
-
-	// deconstruct array of variables and send to Scan
-	if err := row.Scan(columnVars...); err != nil {
+	columnTypes, err := rows.ColumnTypes()
+	if err != nil {
 		return err
 	}
-
-	var dbname bytes.Buffer
-	if c, ok := columnMap["datname"]; ok && *c != nil {
-		// extract the database name from the column map
-		switch datname := (*c).(type) {
-		case string:
-			dbname.WriteString(datname)
-		default:
-			dbname.WriteString(p.service.ConnectionDatabase)
+	numeric := make(map[string]bool, len(columnTypes))
+	for _, ct := range columnTypes {
+		if ct.DatabaseTypeName() == "NUMERIC" {
+			numeric[ct.Name()] = true
 		}
-	} else {
-		dbname.WriteString(p.service.ConnectionDatabase)
 	}
 
-	// Process the additional tags
-	tags := map[string]string{
-		"server": p.service.SanitizedAddress,
-		"db":     dbname.String(),
+	// Prepare the row buffers once and reuse them for every row
+	values := make([]interface{}, len(columns))
+	pointers := make([]interface{}, len(columns))
+	for i := range values {
+		pointers[i] = &values[i]
 	}
 
-	fields := make(map[string]interface{})
-	for col, val := range columnMap {
-		p.Log.Debugf("Column: %s = %T: %v\n", col, *val, *val)
-		_, ignore := ignoredColumns[col]
-		if ignore || *val == nil {
+	// Logging every value is only done on demand: the arguments of a
+	// disabled Debugf call are still boxed and allocated for every column
+	// of every row
+	debug := p.Log.Level() >= telegraf.Debug
+
+	for rows.Next() {
+		if err := rows.Scan(pointers...); err != nil {
+			return err
+		}
+		p.accRow(acc, columns, values, numeric, j, timestamp, debug)
+	}
+	return rows.Err()
+}
+
+func (p *Postgresql) accRow(
+	acc telegraf.Accumulator,
+	columns []string,
+	values []interface{},
+	numeric map[string]bool,
+	j job,
+	timestamp time.Time,
+	debug bool,
+) {
+	q := j.query
+
+	// extract the database name from the row if available
+	dbname := j.datname
+	for i, col := range columns {
+		if col != "datname" {
+			continue
+		}
+		if datname, ok := values[i].(string); ok {
+			dbname = datname
+		}
+		break
+	}
+
+	tags := make(map[string]string, len(q.additionalTags)+2)
+	tags["server"] = p.service.SanitizedAddress
+	tags["db"] = dbname
+
+	fields := make(map[string]interface{}, len(columns))
+	for i, col := range columns {
+		value := values[i]
+		if debug {
+			p.Log.Debugf("Column: %s = %T: %v\n", col, value, value)
+		}
+		if ignoredColumns[col] || value == nil {
 			continue
 		}
 
 		if col == q.Timestamp {
-			if v, ok := (*val).(time.Time); ok {
+			if v, ok := value.(time.Time); ok {
 				timestamp = v
 			}
 			continue
 		}
 
 		if q.additionalTags[col] {
-			v, err := internal.ToString(*val)
+			v, err := internal.ToString(value)
 			if err != nil {
 				p.Log.Debugf("Failed to add %q as additional tag: %v", col, err)
 			} else {
@@ -217,14 +536,68 @@ func (p *Postgresql) accRow(acc telegraf.Accumulator, row scanner, columns []str
 			continue
 		}
 
-		if v, ok := (*val).([]byte); ok {
-			fields[col] = string(v)
-		} else {
-			fields[col] = *val
+		if q.numericFloat && numeric[col] {
+			v, err := internal.ToFloat64(value)
+			if err != nil {
+				p.Log.Debugf("Failed to convert numeric column %q: %v", col, err)
+				continue
+			}
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
+			fields[col] = v
+			continue
+		}
+
+		switch v := value.(type) {
+		case []byte:
+			if q.stringTags {
+				tags[col] = string(v)
+			} else {
+				fields[col] = string(v)
+			}
+		case string:
+			if q.stringTags {
+				tags[col] = v
+			} else {
+				fields[col] = v
+			}
+		default:
+			fields[col] = value
 		}
 	}
 	acc.AddFields(q.Measurement, fields, tags, timestamp)
-	return nil
+}
+
+func refreshDue(updated, now time.Time, interval time.Duration) bool {
+	if updated.IsZero() {
+		return true
+	}
+	return !now.Before(updated.Truncate(interval).Add(interval))
+}
+
+func validateRole(role string) error {
+	switch role {
+	case "", "any", "primary", "replica":
+		return nil
+	default:
+		return fmt.Errorf("invalid role %q, expected one of \"any\", \"primary\" or \"replica\"", role)
+	}
+}
+
+func matchesVersion(q *query, dbVersion int) bool {
+	return q.MinVersion <= dbVersion && (q.MaxVersion == 0 || q.MaxVersion > dbVersion)
+}
+
+func matchesRole(role string, inRecovery bool) bool {
+	switch role {
+	case "primary":
+		return !inRecovery
+	case "replica":
+		return inRecovery
+	default:
+		return true
+	}
 }
 
 func init() {
@@ -234,7 +607,8 @@ func init() {
 				MaxIdle: 1,
 				MaxOpen: 1,
 			},
-			PreparedStatements: true,
+			PreparedStatements:  true,
+			KeepIdleConnections: true,
 		}
 	})
 }
