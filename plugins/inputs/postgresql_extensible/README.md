@@ -89,10 +89,13 @@ to use them.
   ## queries of each database sequentially on one connection.
   # max_connections = 1
 
-  ## Keep the idle connections of the pool for the database given in the
-  ## address open between collections. If unset, they are closed after a
-  ## collection. The connection to any other database is always closed as
-  ## soon as its queries are done, whatever this is set to.
+  ## Keep the connections that ran queries open between collections: the
+  ## pool for the database given in the address, or the pool of a filtered
+  ## database while it is the only one to query. With several databases
+  ## their connections are closed right after their queries, so a server
+  ## with many databases does not accumulate connections. A connection that
+  ## only reads the server information is kept only while
+  ## metadata_refresh_interval is zero.
   # keep_idle_connections = true
 
   ## Use all string columns as tags instead of fields. Queries may override this.
@@ -384,12 +387,26 @@ queries executing concurrently, each on its own connection.
 With several databases matching the filters up to `max_connections`
 databases are processed concurrently. The queries of a database run
 sequentially on a single connection, so the number of connections per
-collection equals the number of databases.
+collection equals the number of databases. The database given in the
+`address` is treated like any other one when it matches the filters: it
+gets a connection of its own instead of sharing the pool created at
+startup, which stays reserved for reading the server information.
 
-`keep_idle_connections` only covers the pool for the database given in the
-`address`. The connection to any other database is always closed as soon as
-its queries are done, to not hold one connection per database on a server
-that may have hundreds of them.
+`keep_idle_connections` keeps the connections that ran queries: the pool
+for the database given in the `address` when it is the only database
+queried, or the pool of a database matching the filters while it stays the
+only one. As soon as a collection queries several databases, the
+connection of each of them is closed right after its queries, so a server
+with hundreds of databases does not hold one connection per database.
+
+The connection to the database given in the `address` that only reads the
+server information is kept only while `metadata_refresh_interval` is zero.
+With the information cached it is read rarely, so the connection is opened
+when needed and closed again.
+
+Connections no longer needed are released at the beginning of the next
+collection, so a database list that grows from one entry to several frees
+them one collection later.
 
 ## Compatibility
 

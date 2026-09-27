@@ -1009,6 +1009,208 @@ func TestColumnTypesIntegration(t *testing.T) {
 	}
 }
 
+// connectionCounter observes a server from an independent connection and
+// reports how many sessions the plugin holds and how many it established
+type connectionCounter struct {
+	t  *testing.T
+	db *sql.DB
+}
+
+func newConnectionCounter(t *testing.T, address string) *connectionCounter {
+	db, err := sql.Open("pgx", address)
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return &connectionCounter{t: t, db: db}
+}
+
+func (c *connectionCounter) close() {
+	c.db.Close()
+}
+
+// held is the number of sessions of the plugin open right now, excluding
+// the session of the counter itself
+func (c *connectionCounter) held() int {
+	var count int
+	query := `SELECT count(*) FROM pg_stat_activity ` +
+		`WHERE application_name = 'pg_ext_test' AND pid <> pg_backend_pid()`
+	require.NoError(c.t, c.db.QueryRow(query).Scan(&count))
+	return count
+}
+
+// established is the number of sessions the server has seen since it
+// started, across all databases. The difference between two readings is
+// the number of connections opened in between.
+func (c *connectionCounter) established() int {
+	var count int
+	require.NoError(c.t, c.db.QueryRow(`SELECT sum(sessions)::bigint FROM pg_stat_database`).Scan(&count))
+	return count
+}
+
+// TestConnectionBehaviourIntegration documents how many connections a
+// collection opens and how many survive it, for every combination of the
+// database filter, keep_idle_connections and the metadata cache. The
+// numbers are taken from the second collection, so they describe the
+// steady state rather than the start-up.
+func TestConnectionBehaviourIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	server := startServer(t, "app_1", "app_2")
+	defer server.stop()
+	server.address += " application_name=pg_ext_test"
+
+	counter := newConnectionCounter(t, server.address)
+	defer counter.close()
+
+	tests := []struct {
+		name string
+		// include is the datname_include filter, empty queries the
+		// database of the address
+		include []string
+		keep    bool
+		// cached keeps the server information of the first collection for
+		// the second one instead of reading it again
+		cached bool
+		// opened is the number of connections the second collection opens
+		opened int
+		// held is the number of connections still open after it
+		held int
+	}{
+		{name: "address database, kept", keep: true, opened: 0, held: 3},
+		{name: "address database, kept, cached", keep: true, cached: true, opened: 0, held: 3},
+		{name: "address database, closed", opened: 3, held: 0},
+		{name: "address database, closed, cached", cached: true, opened: 3, held: 0},
+
+		{name: "one filtered database, kept", include: []string{"app_1"}, keep: true, opened: 0, held: 4},
+		{name: "one filtered database, kept, cached", include: []string{"app_1"}, keep: true, cached: true, opened: 0, held: 3},
+		{name: "one filtered database, closed", include: []string{"app_1"}, opened: 4, held: 0},
+		{name: "one filtered database, closed, cached", include: []string{"app_1"}, cached: true, opened: 3, held: 0},
+
+		{name: "two filtered databases, kept", include: []string{"app_.*"}, keep: true, opened: 2, held: 1},
+		{name: "two filtered databases, kept, cached", include: []string{"app_.*"}, keep: true, cached: true, opened: 2, held: 0},
+		{name: "two filtered databases, closed", include: []string{"app_.*"}, opened: 3, held: 0},
+		{name: "two filtered databases, closed, cached", include: []string{"app_.*"}, cached: true, opened: 2, held: 0},
+
+		{name: "filtered database and address database, kept", include: []string{"app_1", "postgres"}, keep: true, opened: 2, held: 1},
+		{name: "filtered database and address database, kept, cached", include: []string{"app_1", "postgres"}, keep: true, cached: true, opened: 2, held: 0},
+		{name: "filtered database and address database, closed", include: []string{"app_1", "postgres"}, opened: 3, held: 0},
+		{name: "filtered database and address database, closed, cached", include: []string{"app_1", "postgres"}, cached: true, opened: 2, held: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// An hour keeps the server information of the first collection
+			// valid for the second one, zero reads it again
+			var refresh config.Duration
+			if tt.cached {
+				refresh = config.Duration(time.Hour)
+			}
+
+			p := &Postgresql{
+				Log:                     testutil.Logger{},
+				Config:                  postgresql.Config{Address: config.NewSecret([]byte(server.address)), MaxIdle: 1, MaxOpen: 1},
+				MaxConnections:          3,
+				KeepIdleConnections:     tt.keep,
+				MetadataRefreshInterval: refresh,
+				DatnameInclude:          tt.include,
+				Query: []query{
+					{Measurement: "q1", Sqlquery: "SELECT pg_sleep(0.2), 1 AS v"},
+					{Measurement: "q2", Sqlquery: "SELECT pg_sleep(0.2), 2 AS v"},
+					{Measurement: "q3", Sqlquery: "SELECT pg_sleep(0.2), 3 AS v"},
+				},
+			}
+			require.NoError(t, p.Init())
+
+			var acc testutil.Accumulator
+			require.NoError(t, p.Start(&acc))
+			defer p.Stop()
+
+			// Reach the steady state, then measure the collection after it
+			require.NoError(t, p.Gather(&acc))
+			require.Empty(t, acc.Errors)
+			require.Eventually(t, func() bool {
+				return counter.held() == tt.held
+			}, 10*time.Second, 100*time.Millisecond, "the first collection must already hold the expected connections")
+
+			before := counter.established()
+			require.NoError(t, p.Gather(&acc))
+			require.Empty(t, acc.Errors)
+
+			require.Eventually(t, func() bool {
+				return counter.held() == tt.held
+			}, 10*time.Second, 100*time.Millisecond, "connections held after the collection")
+			require.Eventually(t, func() bool {
+				return counter.established()-before == tt.opened
+			}, 10*time.Second, 100*time.Millisecond, "connections opened by the collection")
+		})
+	}
+}
+
+// TestReleaseOnDatabaseListChangeIntegration covers the switch from a
+// single database to several: the connections of the collection that used
+// the full pool must not survive it
+func TestReleaseOnDatabaseListChangeIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	server := startServer(t, "app_1")
+	defer server.stop()
+	server.address += " application_name=pg_ext_test"
+
+	counter := newConnectionCounter(t, server.address)
+	defer counter.close()
+
+	p := &Postgresql{
+		Log:                 testutil.Logger{},
+		Config:              postgresql.Config{Address: config.NewSecret([]byte(server.address)), MaxIdle: 1, MaxOpen: 1},
+		MaxConnections:      3,
+		KeepIdleConnections: true,
+		DatnameInclude:      []string{"app_.*"},
+		Query: []query{
+			{Measurement: "q1", Sqlquery: "SELECT pg_sleep(0.2), 1 AS v"},
+			{Measurement: "q2", Sqlquery: "SELECT pg_sleep(0.2), 2 AS v"},
+			{Measurement: "q3", Sqlquery: "SELECT pg_sleep(0.2), 3 AS v"},
+		},
+	}
+	require.NoError(t, p.Init())
+
+	var acc testutil.Accumulator
+	require.NoError(t, p.Start(&acc))
+	defer p.Stop()
+
+	// Only app_1 matches, so its pool holds the three connections of the
+	// queries and the pool of the address holds the one of the metadata
+	require.NoError(t, p.Gather(&acc))
+	require.Empty(t, acc.Errors)
+	require.Eventually(t, func() bool {
+		return counter.held() == 4
+	}, 10*time.Second, 100*time.Millisecond, "a single filtered database keeps its pool")
+
+	// A second database appears, the pool of app_1 is no longer the pool of
+	// the only database queried and has to go
+	_, err := counter.db.Exec("CREATE DATABASE app_2")
+	require.NoError(t, err)
+
+	require.NoError(t, p.Gather(&acc))
+	require.Empty(t, acc.Errors)
+	require.Eventually(t, func() bool {
+		return counter.held() == 1
+	}, 10*time.Second, 100*time.Millisecond, "only the connection of the address database survives")
+
+	// Back to a single database, the pool is built up again
+	_, err = counter.db.Exec("DROP DATABASE app_2")
+	require.NoError(t, err)
+
+	require.NoError(t, p.Gather(&acc))
+	require.Empty(t, acc.Errors)
+	require.Eventually(t, func() bool {
+		return counter.held() == 4
+	}, 10*time.Second, 100*time.Millisecond, "the pool of the single database is kept again")
+}
+
 func BenchmarkAccRow(b *testing.B) {
 	columns := []string{
 		"datname", "relname", "schemaname", "n_live_tup", "n_dead_tup",
