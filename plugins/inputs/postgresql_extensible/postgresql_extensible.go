@@ -3,6 +3,7 @@ package postgresql_extensible
 
 import (
 	"context"
+	"database/sql"
 	_ "embed"
 	"fmt"
 	"math"
@@ -428,14 +429,23 @@ func (p *Postgresql) refreshMetadata(ctx context.Context) error {
 		return nil
 	}
 
-	row := p.service.DB.QueryRowContext(ctx,
+	// Run all metadata queries on one connection. The pool may not keep idle
+	// connections while the metadata is cached, and would otherwise close
+	// the connection after the first query and open a new one for the next.
+	conn, err := p.service.DB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("connecting for server version and role failed: %w", err)
+	}
+	defer conn.Close()
+
+	row := conn.QueryRowContext(ctx,
 		`SELECT setting::integer / 100, pg_is_in_recovery() FROM pg_settings WHERE name = 'server_version_num'`)
 	if err := row.Scan(&p.dbVersion, &p.inRecovery); err != nil {
 		return fmt.Errorf("querying server version and role failed: %w", err)
 	}
 
 	if len(p.includeRegex) > 0 || len(p.excludeRegex) > 0 {
-		if err := p.refreshDatnames(ctx); err != nil {
+		if err := p.refreshDatnames(ctx, conn); err != nil {
 			return err
 		}
 	}
@@ -445,8 +455,8 @@ func (p *Postgresql) refreshMetadata(ctx context.Context) error {
 }
 
 // refreshDatnames updates the list of databases matching the filters
-func (p *Postgresql) refreshDatnames(ctx context.Context) error {
-	rows, err := p.service.DB.QueryContext(ctx,
+func (p *Postgresql) refreshDatnames(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx,
 		`SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname`)
 	if err != nil {
 		return fmt.Errorf("querying database list failed: %w", err)

@@ -1211,6 +1211,79 @@ func TestReleaseOnDatabaseListChangeIntegration(t *testing.T) {
 	}, 10*time.Second, 100*time.Millisecond, "the pool of the single database is kept again")
 }
 
+// TestMetadataRefreshConnectionsIntegration covers a refresh of the cached
+// server information: all of it has to be read on a single connection, even
+// though the pool of the address database keeps no idle connection while the
+// information is cached
+func TestMetadataRefreshConnectionsIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	server := startServer(t, "app_1", "app_2")
+	defer server.stop()
+	server.address += " application_name=pg_ext_test"
+
+	counter := newConnectionCounter(t, server.address)
+	defer counter.close()
+
+	tests := []struct {
+		name    string
+		include []string
+		// opened is the number of connections the collection refreshing the
+		// server information opens
+		opened int
+		held   int
+	}{
+		{name: "address database", opened: 0, held: 3},
+		{name: "one filtered database", include: []string{"app_1"}, opened: 1, held: 3},
+		{name: "two filtered databases", include: []string{"app_.*"}, opened: 3, held: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Postgresql{
+				Log:                     testutil.Logger{},
+				Config:                  postgresql.Config{Address: config.NewSecret([]byte(server.address)), MaxIdle: 1, MaxOpen: 1},
+				MaxConnections:          3,
+				KeepIdleConnections:     true,
+				MetadataRefreshInterval: config.Duration(time.Hour),
+				DatnameInclude:          tt.include,
+				Query: []query{
+					{Measurement: "q1", Sqlquery: "SELECT pg_sleep(0.2), 1 AS v"},
+					{Measurement: "q2", Sqlquery: "SELECT pg_sleep(0.2), 2 AS v"},
+					{Measurement: "q3", Sqlquery: "SELECT pg_sleep(0.2), 3 AS v"},
+				},
+			}
+			require.NoError(t, p.Init())
+
+			var acc testutil.Accumulator
+			require.NoError(t, p.Start(&acc))
+			defer p.Stop()
+
+			require.NoError(t, p.Gather(&acc))
+			require.Empty(t, acc.Errors)
+			require.Eventually(t, func() bool {
+				return counter.held() == tt.held
+			}, 10*time.Second, 100*time.Millisecond, "the first collection must already hold the expected connections")
+
+			// Make the server information due for a refresh
+			p.metadataUpdated = time.Time{}
+
+			before := counter.established()
+			require.NoError(t, p.Gather(&acc))
+			require.Empty(t, acc.Errors)
+
+			require.Eventually(t, func() bool {
+				return counter.held() == tt.held
+			}, 10*time.Second, 100*time.Millisecond, "connections held after the collection")
+			require.Eventually(t, func() bool {
+				return counter.established()-before == tt.opened
+			}, 10*time.Second, 100*time.Millisecond, "connections opened by the collection")
+		})
+	}
+}
+
 func BenchmarkAccRow(b *testing.B) {
 	columns := []string{
 		"datname", "relname", "schemaname", "n_live_tup", "n_dead_tup",
